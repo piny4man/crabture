@@ -11,9 +11,11 @@ jobs:
     if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@v3
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
 
       - name: Verify tag matches Cargo.toml version
         shell: bash
@@ -24,10 +26,6 @@ jobs:
           echo "Tag: $TAG  | Cargo.toml: $CARGO_V"
           [ "$TAG" = "$CARGO_V" ] || { echo "::error ::Tag ($TAG) != Cargo.toml ($CARGO_V)"; exit 1; }
 
-      - name: Dry run (sanity check)
-        run: cargo publish --dry-run --locked
-
-      - name: Publish
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --locked
+      - uses: katyo/publish-crates@v2
+        with:
+          registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
