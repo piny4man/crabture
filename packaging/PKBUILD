@@ -1,0 +1,34 @@
+# Maintainer: YOUR_NAME <you@example.com>
+pkgname=crabture-git
+_pkgname=crabture
+pkgver=0.1.0.r0.g0000000
+pkgrel=1
+pkgdesc='Fast Wayland screenshots for Hyprland (grimblast + rofi + hyprpicker), written in Rust.'
+arch=('x86_64' 'aarch64')
+url="https://github.com/YOUR_GITHUB/${_pkgname}"
+license=('MIT')
+depends=('rofi' 'libnotify' 'slurp')
+makedepends=('git' 'rust' 'cargo')
+optdepends=('hyprpicker: freeze effect during area selection' 'grimblast: screenshot helper from hyprland-contrib')
+provides=("${_pkgname}")
+conflicts=("${_pkgname}")
+source=("git+${url}.git")
+md5sums=('SKIP')
+
+pkgver() {
+  cd "${srcdir}/${_pkgname}"
+  # Example: 0.1.0.r23.gabcdef1
+  printf "%s.r%s.g%s" "$(grep '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+  cd "${srcdir}/${_pkgname}"
+  cargo build --release --locked
+}
+
+package() {
+  cd "${srcdir}/${_pkgname}"
+  install -Dm755 "target/release/${_pkgname}" "${pkgdir}/usr/bin/${_pkgname}"
+  install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${_pkgname}/LICENSE"
+  install -Dm644 README.md "${pkgdir}/usr/share/doc/${_pkgname}/README.md"
+}

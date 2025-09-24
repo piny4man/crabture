@@ -1,0 +1,16 @@
+[package]
+name = "crabture"
+version = "0.1.0"
+edition = "2024"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 2
+panic = "abort"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+which = "6"
+time = { version = "0.3", features = ["macros", "local-offset"] }

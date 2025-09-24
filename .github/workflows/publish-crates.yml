@@ -1,0 +1,33 @@
+name: Publish to crates.io
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  publish:
+    # skip prereleases like v1.2.3-rc.1
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify tag matches Cargo.toml version
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#v}"
+          CARGO_V=$(grep '^version\s*=\s*"' Cargo.toml | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "Tag: $TAG  | Cargo.toml: $CARGO_V"
+          [ "$TAG" = "$CARGO_V" ] || { echo "::error ::Tag ($TAG) != Cargo.toml ($CARGO_V)"; exit 1; }
+
+      - name: Dry run (sanity check)
+        run: cargo publish --dry-run --locked
+
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
