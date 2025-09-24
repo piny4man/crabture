@@ -1,7 +1,15 @@
 [package]
 name = "crabture"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
+description = "Fast Wayland screenshots for Hyprland (rofi + grimblast + hyprpicker), written in Rust."
+license = "MIT"                       # or: "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/<YOUR_GITHUB>/crabture"
+homepage = "https://github.com/<YOUR_GITHUB>/crabture"
+keywords = ["wayland", "hyprland", "screenshot", "grimblast", "rofi"]
+categories = ["command-line-utilities"]
+include = ["src/**", "Cargo.toml", "README.md", "LICENSE"]
 
 [profile.release]
 lto = "thin"
