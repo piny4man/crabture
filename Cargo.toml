@@ -1,12 +1,12 @@
 [package]
 name = "crabture"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "Fast Wayland screenshots for Hyprland (rofi + grimblast + hyprpicker), written in Rust."
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/pin4man/crabture"
-homepage = "https://github.com/pin4man/crabture"
+repository = "https://github.com/piny4man/crabture"
+homepage = "https://github.com/piny4man/crabture"
 keywords = ["wayland", "hyprland", "screenshot", "grimblast", "rofi"]
 categories = ["command-line-utilities"]
 include = ["src/**", "Cargo.toml", "README.md", "LICENSE"]
