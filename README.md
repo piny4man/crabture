@@ -2,7 +2,7 @@
 
 Standalone Linux screenshot tool written in Rust. No external dependencies required — works on both X11 and Wayland.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
 [![CI](https://github.com/piny4man/crabture/actions/workflows/ci.yml/badge.svg)](https://github.com/piny4man/crabture/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/crabture.svg)](https://crates.io/crates/crabture)
 
@@ -83,4 +83,4 @@ crabture --list-monitors
 
 ## License
 
-MIT
+GPL-3.0 — see [LICENSE](LICENSE) for details.
