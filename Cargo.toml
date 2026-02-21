@@ -1,13 +1,13 @@
 [package]
 name = "crabture"
-version = "0.1.5"
+version = "0.2.0"
 edition = "2024"
-description = "Fast Wayland screenshots for Hyprland (rofi + grimblast + hyprpicker), written in Rust."
-license = "MIT"
+description = "Standalone Linux screenshot tool — no external dependencies required. Supports X11 and Wayland."
+license = "GPL-3.0-only"
 readme = "README.md"
 repository = "https://github.com/piny4man/crabture"
 homepage = "https://github.com/piny4man/crabture"
-keywords = ["wayland", "hyprland", "screenshot", "grimblast", "rofi"]
+keywords = ["screenshot", "wayland", "x11", "linux", "clipboard"]
 categories = ["command-line-utilities"]
 include = ["src/**", "Cargo.toml", "README.md", "LICENSE"]
 
@@ -20,5 +20,10 @@ panic = "abort"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
-which = "6"
 time = { version = "0.3", features = ["macros", "local-offset"] }
+xcap = "0.8"
+image = "0.25"
+arboard = { version = "3", features = ["image-data", "wayland-data-control"] }
+notify-rust = "4"
+dialoguer = "0.11"
+minifb = "0.27"
