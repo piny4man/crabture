@@ -12,19 +12,10 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - x86_64-unknown-linux-gnu
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
 
@@ -41,29 +32,8 @@ jobs:
           libxcb-shm0-dev
           libxcb-randr0-dev
 
-      # Install per-target toolchains + set linkers
-      - name: Install target toolchains
-        shell: bash
-        run: |
-          set -eux
-          case "${{ matrix.target }}" in
-            x86_64-unknown-linux-musl)
-              sudo apt-get install -y musl-tools
-              # tell cargo/rustc to use musl-gcc for this target
-              echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> $GITHUB_ENV
-              echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc" >> $GITHUB_ENV
-              ;;
-            aarch64-unknown-linux-gnu)
-              sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross
-              # tell cargo/rustc to use the arm64 cross linker/ar
-              echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
-              echo "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar"  >> $GITHUB_ENV
-              echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
-              ;;
-          esac
-
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --locked
 
       - name: Package
         run: |
@@ -71,16 +41,16 @@ jobs:
           mkdir -p dist
           BIN=crabture
           TAG="${GITHUB_REF_NAME}"
-          TGT="${{ matrix.target }}"
-          SRC="target/${TGT}/release/${BIN}"
+          TGT="x86_64-unknown-linux-gnu"
+          SRC="target/release/${BIN}"
           TAR="crabture-${TAG}-${TGT}.tar.gz"
           chmod +x "${SRC}"
-          cp LICENSE README.md "target/${TGT}/release/" || true
-          tar -czf "dist/${TAR}" -C "target/${TGT}/release" "${BIN}" LICENSE README.md
+          cp LICENSE README.md target/release/ || true
+          tar -czf "dist/${TAR}" -C target/release "${BIN}" LICENSE README.md
           echo "ASSET=dist/${TAR}" >> $GITHUB_ENV
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.target }}
+          name: ${{ github.ref_name }}-x86_64-unknown-linux-gnu
           path: ${{ env.ASSET }}
