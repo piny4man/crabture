@@ -12,7 +12,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libpipewire-0.3-dev
+        run: >
+          sudo apt-get update && sudo apt-get install -y
+          libwayland-dev
+          libpipewire-0.3-dev
+          libegl-dev
+          libgbm-dev
+          libdrm-dev
+          libxcb1-dev
+          libxcb-shm0-dev
+          libxcb-randr0-dev
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
