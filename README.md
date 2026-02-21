@@ -43,14 +43,24 @@ cargo build --release
 paru -S crabture-git
 ```
 
-### System dependencies
+### Build dependencies
 
-On Debian/Ubuntu you may need:
+These are only needed when **building from source**. Prebuilt binaries from the
+[releases page](https://github.com/piny4man/crabture/releases) have no extra
+runtime dependencies.
+
+#### Debian / Ubuntu
 
 ```sh
 sudo apt-get install -y \
-  libwayland-dev libpipewire-0.3-dev libegl-dev \
+  libclang-dev libwayland-dev libpipewire-0.3-dev libegl-dev \
   libgbm-dev libdrm-dev libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev
+```
+
+#### Arch Linux
+
+```sh
+sudo pacman -S clang libxcb wayland pipewire
 ```
 
 ## Usage
