@@ -11,11 +11,21 @@ jobs:
     if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system build dependencies
+        run: >
+          sudo apt-get update && sudo apt-get install -y
+          libclang-dev
+          libwayland-dev
+          libpipewire-0.3-dev
+          libegl-dev
+          libgbm-dev
+          libdrm-dev
+          libxcb1-dev
+          libxcb-shm0-dev
+          libxcb-randr0-dev
 
       - name: Verify tag matches Cargo.toml version
         shell: bash
