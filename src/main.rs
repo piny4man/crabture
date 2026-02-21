@@ -63,13 +63,10 @@ fn main() -> Result<()> {
     if cli.list_monitors {
         let monitors = Monitor::all().context("failed to enumerate monitors")?;
         for (i, m) in monitors.iter().enumerate() {
-            println!(
-                "  Monitor {}: {} ({}x{})",
-                i + 1,
-                m.name(),
-                m.width(),
-                m.height(),
-            );
+            let name = m.name().unwrap_or_else(|_| "unknown".into());
+            let w = m.width().unwrap_or(0);
+            let h = m.height().unwrap_or(0);
+            println!("  Monitor {}: {} ({}x{})", i + 1, name, w, h);
         }
         return Ok(());
     }
@@ -126,13 +123,10 @@ fn run_interactive(shot_dir: &Path, format: &str) -> Result<()> {
     let monitors = Monitor::all().context("failed to enumerate monitors")?;
     let mut target_labels: Vec<String> = vec!["Primary monitor".into()];
     for (i, m) in monitors.iter().enumerate() {
-        target_labels.push(format!(
-            "Monitor {}: {} ({}x{})",
-            i + 1,
-            m.name(),
-            m.width(),
-            m.height()
-        ));
+        let name = m.name().unwrap_or_else(|_| "unknown".into());
+        let w = m.width().unwrap_or(0);
+        let h = m.height().unwrap_or(0);
+        target_labels.push(format!("Monitor {}: {} ({}x{})", i + 1, name, w, h));
     }
 
     let target = Select::with_theme(&theme)

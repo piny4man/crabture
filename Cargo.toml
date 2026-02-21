@@ -21,8 +21,8 @@ panic = "abort"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 time = { version = "0.3", features = ["macros", "local-offset"] }
-xcap = "0.0"
-image = "0.24"
-arboard = { version = "3", features = ["image-data"] }
+xcap = "0.8"
+image = "0.25"
+arboard = { version = "3", features = ["image-data", "wayland-data-control"] }
 notify-rust = "4"
 dialoguer = "0.11"
