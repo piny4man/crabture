@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
 use arboard::{Clipboard, ImageData};
 use clap::Parser;
-use dialoguer::{Select, theme::ColorfulTheme};
+use dialoguer::{Input, Select, theme::ColorfulTheme};
+use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
 use notify_rust::Notification;
 use std::{
     borrow::Cow,
@@ -24,6 +25,14 @@ struct Cli {
     #[arg(long)]
     monitor: Option<usize>,
 
+    /// Interactive area selection with cursor
+    #[arg(long)]
+    select: bool,
+
+    /// Capture a region by coordinates: x,y,WxH (e.g. 100,200,800x600)
+    #[arg(long)]
+    region: Option<String>,
+
     /// Use interactive TUI flow
     #[arg(long)]
     interactive: bool,
@@ -44,10 +53,12 @@ struct Cli {
     list_monitors: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum CaptureKind {
     Primary,
     Monitor(usize),
+    Region { x: u32, y: u32, w: u32, h: u32 },
+    Selection,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -77,15 +88,27 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| home().join("Pictures"));
     fs::create_dir_all(&shot_dir).ok();
 
+    let how = if cli.copy {
+        SaveHow::Copy
+    } else {
+        SaveHow::Save
+    };
+
+    if cli.select {
+        let img = select_area()?;
+        return save_screenshot(&img, how, &shot_dir, &cli.format);
+    }
+
+    if let Some(ref region) = cli.region {
+        let kind = parse_region(region)?;
+        let img = capture(kind)?;
+        return save_screenshot(&img, how, &shot_dir, &cli.format);
+    }
+
     if cli.instant || cli.monitor.is_some() {
         let kind = match cli.monitor {
             Some(n) => CaptureKind::Monitor(n.saturating_sub(1)),
             None => CaptureKind::Primary,
-        };
-        let how = if cli.copy {
-            SaveHow::Copy
-        } else {
-            SaveHow::Save
         };
         let img = capture(kind)?;
         return save_screenshot(&img, how, &shot_dir, &cli.format);
@@ -121,7 +144,11 @@ fn run_interactive(shot_dir: &Path, format: &str) -> Result<()> {
 
     // 2. Capture target
     let monitors = Monitor::all().context("failed to enumerate monitors")?;
-    let mut target_labels: Vec<String> = vec!["Primary monitor".into()];
+    let mut target_labels: Vec<String> = vec![
+        "Primary monitor".into(),
+        "Select area (cursor)".into(),
+        "Region (coordinates)".into(),
+    ];
     for (i, m) in monitors.iter().enumerate() {
         let name = m.name().unwrap_or_else(|_| "unknown".into());
         let w = m.width().unwrap_or(0);
@@ -136,10 +163,17 @@ fn run_interactive(shot_dir: &Path, format: &str) -> Result<()> {
         .interact()
         .context("selection cancelled")?;
 
-    let kind = if target == 0 {
-        CaptureKind::Primary
-    } else {
-        CaptureKind::Monitor(target - 1)
+    let kind = match target {
+        0 => CaptureKind::Primary,
+        1 => CaptureKind::Selection,
+        2 => {
+            let region_str: String = Input::with_theme(&theme)
+                .with_prompt("Region (x,y,WxH)")
+                .interact_text()
+                .context("input cancelled")?;
+            parse_region(&region_str)?
+        }
+        n => CaptureKind::Monitor(n - 3),
     };
 
     // 3. Save method
@@ -161,8 +195,144 @@ fn run_interactive(shot_dir: &Path, format: &str) -> Result<()> {
         countdown(delay);
     }
 
-    let img = capture(kind)?;
+    let img = match kind {
+        CaptureKind::Selection => select_area()?,
+        other => capture(other)?,
+    };
     save_screenshot(&img, how, shot_dir, format)
+}
+
+fn select_area() -> Result<image::RgbaImage> {
+    // 1. Capture full screen
+    let monitors = Monitor::all().context("failed to enumerate monitors")?;
+    let monitor = monitors.into_iter().next().context("no monitors found")?;
+    let screenshot = monitor.capture_image().context("failed to capture screen")?;
+    let width = screenshot.width() as usize;
+    let height = screenshot.height() as usize;
+
+    // 2. Convert to minifb pixel format (0x00RRGGBB)
+    let original: Vec<u32> = screenshot
+        .pixels()
+        .map(|p| ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | (p[2] as u32))
+        .collect();
+
+    let dark: Vec<u32> = screenshot
+        .pixels()
+        .map(|p| {
+            let r = (p[0] as u32) / 3;
+            let g = (p[1] as u32) / 3;
+            let b = (p[2] as u32) / 3;
+            (r << 16) | (g << 8) | b
+        })
+        .collect();
+
+    let mut buffer = dark.clone();
+
+    // 3. Open borderless topmost window
+    let mut window = Window::new(
+        "",
+        width,
+        height,
+        WindowOptions {
+            borderless: true,
+            topmost: true,
+            title: false,
+            ..Default::default()
+        },
+    )
+    .context("failed to create selection window")?;
+
+    let mut start: Option<(usize, usize)> = None;
+    let mut selection: Option<(usize, usize, usize, usize)> = None;
+    let mut selecting = false;
+
+    // 4. Event loop: click and drag to select
+    while window.is_open() && !window.is_key_down(Key::Escape) {
+        if let Some((mx, my)) = window.get_mouse_pos(MouseMode::Clamp) {
+            let mx = (mx as usize).min(width.saturating_sub(1));
+            let my = (my as usize).min(height.saturating_sub(1));
+
+            if window.get_mouse_down(MouseButton::Left) {
+                if !selecting {
+                    start = Some((mx, my));
+                    selecting = true;
+                }
+
+                if let Some((sx, sy)) = start {
+                    let x1 = sx.min(mx);
+                    let y1 = sy.min(my);
+                    let x2 = sx.max(mx);
+                    let y2 = sy.max(my);
+                    selection = Some((x1, y1, x2.saturating_sub(x1), y2.saturating_sub(y1)));
+
+                    // Redraw: dark everywhere, bright in selection
+                    buffer.copy_from_slice(&dark);
+                    for row in y1..y2.min(height) {
+                        for col in x1..x2.min(width) {
+                            buffer[row * width + col] = original[row * width + col];
+                        }
+                    }
+
+                    // Draw border around selection
+                    let border_color: u32 = 0x00_FF_FF_FF;
+                    for col in x1..x2.min(width) {
+                        buffer[y1 * width + col] = border_color;
+                        if y2 > 0 && y2 - 1 < height {
+                            buffer[(y2 - 1) * width + col] = border_color;
+                        }
+                    }
+                    for row in y1..y2.min(height) {
+                        buffer[row * width + x1] = border_color;
+                        if x2 > 0 && x2 - 1 < width {
+                            buffer[row * width + x2 - 1] = border_color;
+                        }
+                    }
+                }
+            } else if selecting {
+                // Mouse released — selection complete
+                break;
+            }
+        }
+
+        window
+            .update_with_buffer(&buffer, width, height)
+            .context("failed to update window")?;
+    }
+
+    // 5. Crop the original screenshot to the selection
+    if let Some((x, y, w, h)) = selection {
+        if w < 2 || h < 2 {
+            bail!("selection too small");
+        }
+        let cropped = image::imageops::crop_imm(
+            &screenshot,
+            x as u32,
+            y as u32,
+            w as u32,
+            h as u32,
+        )
+        .to_image();
+        Ok(cropped)
+    } else {
+        bail!("selection cancelled (press Escape or close window)")
+    }
+}
+
+fn parse_region(s: &str) -> Result<CaptureKind> {
+    // Format: x,y,WxH  e.g. "100,200,800x600"
+    let parts: Vec<&str> = s.split(',').collect();
+    if parts.len() != 3 {
+        bail!("region format must be x,y,WxH (e.g. 100,200,800x600)");
+    }
+    let x: u32 = parts[0].parse().context("invalid x coordinate")?;
+    let y: u32 = parts[1].parse().context("invalid y coordinate")?;
+    let wh: Vec<&str> = parts[2].split('x').collect();
+    if wh.len() != 2 {
+        bail!("region size must be WxH (e.g. 800x600)");
+    }
+    let w: u32 = wh[0].parse().context("invalid width")?;
+    let h: u32 = wh[1].parse().context("invalid height")?;
+    Ok(CaptureKind::Region { x, y, w, h })
 }
 
 fn capture(kind: CaptureKind) -> Result<image::RgbaImage> {
@@ -171,15 +341,27 @@ fn capture(kind: CaptureKind) -> Result<image::RgbaImage> {
         bail!("no monitors found");
     }
 
-    let monitor = match kind {
-        CaptureKind::Primary => monitors.into_iter().next().unwrap(),
+    match kind {
+        CaptureKind::Primary => monitors
+            .into_iter()
+            .next()
+            .unwrap()
+            .capture_image()
+            .context("failed to capture screen"),
         CaptureKind::Monitor(idx) => monitors
             .into_iter()
             .nth(idx)
-            .context("monitor index out of range")?,
-    };
-
-    monitor.capture_image().context("failed to capture screen")
+            .context("monitor index out of range")?
+            .capture_image()
+            .context("failed to capture monitor"),
+        CaptureKind::Region { x, y, w, h } => monitors
+            .into_iter()
+            .next()
+            .unwrap()
+            .capture_region(x, y, w, h)
+            .context("failed to capture region"),
+        CaptureKind::Selection => select_area(),
+    }
 }
 
 fn save_screenshot(

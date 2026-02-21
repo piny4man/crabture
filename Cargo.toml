@@ -26,3 +26,4 @@ image = "0.25"
 arboard = { version = "3", features = ["image-data", "wayland-data-control"] }
 notify-rust = "4"
 dialoguer = "0.11"
+minifb = "0.27"
