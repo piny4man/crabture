@@ -1,28 +1,30 @@
 use anyhow::{Context, Result, bail};
+use arboard::{Clipboard, ImageData};
 use clap::Parser;
+use dialoguer::{Select, theme::ColorfulTheme};
+use notify_rust::Notification;
 use std::{
+    borrow::Cow,
     env, fs,
-    io::Write,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     thread::sleep,
     time::Duration,
 };
 use time::OffsetDateTime;
-use which::which;
+use xcap::Monitor;
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Rusty screenshot helper (grimblast + rofi)")]
+#[command(version, about = "Standalone screenshot tool — no external dependencies required")]
 struct Cli {
     /// Take immediate full-screen shot (no UI)
     #[arg(long)]
     instant: bool,
 
-    /// Take immediate area shot (no UI)
+    /// Capture a specific monitor by index (1-based)
     #[arg(long)]
-    instant_area: bool,
+    monitor: Option<usize>,
 
-    /// Use interactive rofi flow
+    /// Use interactive TUI flow
     #[arg(long)]
     interactive: bool,
 
@@ -33,220 +35,235 @@ struct Cli {
     #[arg(long, default_value = "png")]
     format: String,
 
-    /// Optional rofi config path
+    /// Copy to clipboard instead of saving to file
     #[arg(long)]
-    rofi_config: Option<PathBuf>,
+    copy: bool,
+
+    /// List available monitors and exit
+    #[arg(long)]
+    list_monitors: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
 enum CaptureKind {
-    Screen,
-    Output,
-    Area,
+    Primary,
+    Monitor(usize),
 }
 
 #[derive(Clone, Copy, Debug)]
 enum SaveHow {
     Copy,
     Save,
-    Copysave,
-    Edit,
+    CopyAndSave,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    ensure_tools(&["grimblast", "rofi", "notify-send"])?;
-
-    let _ = which("slurp");
+    if cli.list_monitors {
+        let monitors = Monitor::all().context("failed to enumerate monitors")?;
+        for (i, m) in monitors.iter().enumerate() {
+            println!(
+                "  Monitor {}: {} ({}x{})",
+                i + 1,
+                m.name(),
+                m.width(),
+                m.height(),
+            );
+        }
+        return Ok(());
+    }
 
     let shot_dir = cli
         .dir
         .or_else(xdg_screenshots_dir)
-        .unwrap_or(home().join("Pictures"));
+        .unwrap_or_else(|| home().join("Pictures"));
     fs::create_dir_all(&shot_dir).ok();
 
-    if cli.instant {
-        take(
-            CaptureKind::Screen,
-            SaveHow::Save,
-            &shot_dir,
-            &cli.format,
-            None,
-        )?;
+    if cli.instant || cli.monitor.is_some() {
+        let kind = match cli.monitor {
+            Some(n) => CaptureKind::Monitor(n.saturating_sub(1)),
+            None => CaptureKind::Primary,
+        };
+        let how = if cli.copy {
+            SaveHow::Copy
+        } else {
+            SaveHow::Save
+        };
+        let img = capture(kind)?;
+        return save_screenshot(&img, how, &shot_dir, &cli.format);
     }
 
-    if cli.instant_area {
-        take(
-            CaptureKind::Area,
-            SaveHow::Save,
-            &shot_dir,
-            &cli.format,
-            None,
-        )?;
-        return Ok(());
-    }
-
-    // default to interactive if nothing else was specified
-    run_interactive(&shot_dir, &cli.format, cli.rofi_config.as_deref())
+    // default to interactive
+    run_interactive(&shot_dir, &cli.format)
 }
 
-fn run_interactive(shot_dir: &Path, format: &str, rofi_cfg: Option<&Path>) -> Result<()> {
-    let when = rofi_pick("Take screenshot", &["Immediate", "Delayed"], rofi_cfg)?;
-    let delay = if when == "Delayed" {
-        let t = rofi_pick(
-            "Choose timer",
-            &["5s", "10s", "20s", "30s", "60s"],
-            rofi_cfg,
-        )?;
-        t.trim_end_matches("s").parse::<u64>().unwrap_or(5)
+fn run_interactive(shot_dir: &Path, format: &str) -> Result<()> {
+    let theme = ColorfulTheme::default();
+
+    // 1. Timing
+    let timing = Select::with_theme(&theme)
+        .with_prompt("When to take screenshot")
+        .items(&["Immediate", "Delayed"])
+        .default(0)
+        .interact()
+        .context("selection cancelled")?;
+
+    let delay: u64 = if timing == 1 {
+        let delays = ["5s", "10s", "20s", "30s", "60s"];
+        let d = Select::with_theme(&theme)
+            .with_prompt("Choose delay")
+            .items(&delays)
+            .default(0)
+            .interact()
+            .context("selection cancelled")?;
+        [5, 10, 20, 30, 60][d]
     } else {
         0
     };
 
-    let kind = match rofi_pick(
-        "Type of screenshot",
-        &[
-            "Capture Everything",
-            "Capture Active Display",
-            "Capture Selection",
-        ],
-        rofi_cfg,
-    )?
-    .as_str()
-    {
-        "Capture Everything" => CaptureKind::Screen,
-        "Capture Active Display" => CaptureKind::Output,
-        _ => CaptureKind::Area,
-    };
-
-    let how = match rofi_pick(
-        "How to save",
-        &["Copy", "Save", "Copy & Save", "Edit"],
-        rofi_cfg,
-    )?
-    .as_str()
-    {
-        "Copy" => SaveHow::Copy,
-        "Save" => SaveHow::Save,
-        "Copy & Save" => SaveHow::Copysave,
-        _ => SaveHow::Edit,
-    };
-
-    if delay > 0 {
-        countdown(delay)?;
+    // 2. Capture target
+    let monitors = Monitor::all().context("failed to enumerate monitors")?;
+    let mut target_labels: Vec<String> = vec!["Primary monitor".into()];
+    for (i, m) in monitors.iter().enumerate() {
+        target_labels.push(format!(
+            "Monitor {}: {} ({}x{})",
+            i + 1,
+            m.name(),
+            m.width(),
+            m.height()
+        ));
     }
 
-    take(kind, how, shot_dir, format, rofi_cfg)
+    let target = Select::with_theme(&theme)
+        .with_prompt("Capture target")
+        .items(&target_labels)
+        .default(0)
+        .interact()
+        .context("selection cancelled")?;
+
+    let kind = if target == 0 {
+        CaptureKind::Primary
+    } else {
+        CaptureKind::Monitor(target - 1)
+    };
+
+    // 3. Save method
+    let how_idx = Select::with_theme(&theme)
+        .with_prompt("Save method")
+        .items(&["Copy to clipboard", "Save to file", "Copy & Save"])
+        .default(2)
+        .interact()
+        .context("selection cancelled")?;
+
+    let how = match how_idx {
+        0 => SaveHow::Copy,
+        1 => SaveHow::Save,
+        _ => SaveHow::CopyAndSave,
+    };
+
+    // Countdown
+    if delay > 0 {
+        countdown(delay);
+    }
+
+    let img = capture(kind)?;
+    save_screenshot(&img, how, shot_dir, format)
 }
 
-fn take(
-    kind: CaptureKind,
+fn capture(kind: CaptureKind) -> Result<image::RgbaImage> {
+    let monitors = Monitor::all().context("failed to enumerate monitors")?;
+    if monitors.is_empty() {
+        bail!("no monitors found");
+    }
+
+    let monitor = match kind {
+        CaptureKind::Primary => monitors.into_iter().next().unwrap(),
+        CaptureKind::Monitor(idx) => monitors
+            .into_iter()
+            .nth(idx)
+            .context("monitor index out of range")?,
+    };
+
+    monitor.capture_image().context("failed to capture screen")
+}
+
+fn save_screenshot(
+    img: &image::RgbaImage,
     how: SaveHow,
     shot_dir: &Path,
     format: &str,
-    _rofi_cfg: Option<&Path>,
 ) -> Result<()> {
-    let name = file_name(format);
-    let tmp_path = home().join(&name);
-
-    // freeze screen for area selection if hyprpicker exists; let grimblast run slurp
-    let mut picker_child = if matches!(kind, CaptureKind::Area) && which("hyprpicker").is_ok() {
-        let mut c = Command::new("hyprpicker");
-        c.args(["-r", "-z"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        c.spawn().ok()
-    } else {
-        None
-    };
-
-    // map enums to grimblast args
-    let how_s = match how {
-        SaveHow::Copy => "copy",
-        SaveHow::Save => "save",
-        SaveHow::Copysave => "copysave",
-        SaveHow::Edit => "edit",
-    };
-    let kind_s = match kind {
-        CaptureKind::Screen => "screen",
-        CaptureKind::Output => "output",
-        CaptureKind::Area => "area",
-    };
-
-    // run grimblast
-    let status = Command::new("grimblast")
-        .args(["--notify", how_s, kind_s, &tmp_path.to_string_lossy()])
-        .status()
-        .context("running grimblast")?;
-
-    // unfreeze screen if we stared hyprpicker
-    if let Some(mut child) = picker_child.take() {
-        let _ = child.kill();
-    }
-
-    if !status.success() {
-        bail!("grimblast failed");
-    }
-
-    // move into screenshots dir if a file was written (copy mode may not write a file)
-    if tmp_path.exists() {
-        let dest = shot_dir.join(name);
-        fs::rename(&tmp_path, &dest).or_else(|_| {
-            fs::copy(&tmp_path, &dest)
-                .map(|_| {
-                    let _ = fs::remove_file(&tmp_path);
-                })
-                .ok();
-            Ok::<(), anyhow::Error>(())
-        })?;
-        notify("Screenshot saved", &format!("DIR: {}", shot_dir.display()))?;
+    match how {
+        SaveHow::Copy => {
+            copy_to_clipboard(img)?;
+            notify("Screenshot copied", "Image copied to clipboard");
+        }
+        SaveHow::Save => {
+            let path = save_to_file(img, shot_dir, format)?;
+            notify(
+                "Screenshot saved",
+                &format!("Saved to {}", path.display()),
+            );
+        }
+        SaveHow::CopyAndSave => {
+            copy_to_clipboard(img)?;
+            let path = save_to_file(img, shot_dir, format)?;
+            notify(
+                "Screenshot saved & copied",
+                &format!("Saved to {}", path.display()),
+            );
+        }
     }
     Ok(())
 }
 
-fn rofi_pick(prompt: &str, options: &[&str], cfg: Option<&Path>) -> Result<String> {
-    let mut cmd = Command::new("rofi");
-    cmd.args(["-dmenu", "-i", "-no-show-icons", "-p", prompt]);
-    if let Some(c) = cfg {
-        cmd.args(["-config", &c.to_string_lossy()]);
-    }
-    let input = options.join("\n");
-    let mut child = cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("spawning rofi")?;
-    {
-        let mut stdin = child.stdin.take().unwrap();
-        stdin.write_all(input.as_bytes())?;
-    }
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        bail!("rofi cancceled");
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+fn copy_to_clipboard(img: &image::RgbaImage) -> Result<()> {
+    let mut clipboard = Clipboard::new().context("failed to open clipboard")?;
+    let data = ImageData {
+        width: img.width() as usize,
+        height: img.height() as usize,
+        bytes: Cow::Borrowed(img.as_raw()),
+    };
+    clipboard
+        .set_image(data)
+        .context("failed to copy image to clipboard")
 }
 
-fn countdown(mut secs: u64) -> Result<()> {
+fn save_to_file(img: &image::RgbaImage, shot_dir: &Path, format: &str) -> Result<PathBuf> {
+    let name = file_name(format);
+    let path = shot_dir.join(&name);
+
+    if format.eq_ignore_ascii_case("jpg") || format.eq_ignore_ascii_case("jpeg") {
+        let rgb = image::DynamicImage::ImageRgba8(img.clone()).to_rgb8();
+        rgb.save(&path).context("failed to save screenshot")?;
+    } else {
+        img.save(&path).context("failed to save screenshot")?;
+    }
+
+    Ok(path)
+}
+
+fn countdown(mut secs: u64) {
     if secs > 10 {
-        notify("Taking screenshot", &format!("in {secs} seconds"))?;
+        notify("Taking screenshot", &format!("in {secs} seconds"));
         sleep(Duration::from_secs(secs - 10));
         secs = 10;
     }
     while secs > 0 {
-        notify("Taking screenshot", &format!("in {secs} seconds"))?;
+        notify("Taking screenshot", &format!("in {secs} seconds"));
         sleep(Duration::from_secs(1));
         secs -= 1;
     }
-    Ok(())
 }
 
-fn notify(title: &str, body: &str) -> Result<()> {
-    let _ = Command::new("notify-send")
-        .args(["-t", "1000", title, body])
-        .status();
-    Ok(())
+fn notify(title: &str, body: &str) {
+    Notification::new()
+        .summary(title)
+        .body(body)
+        .timeout(notify_rust::Timeout::Milliseconds(2000))
+        .show()
+        .ok();
 }
 
 fn file_name(fmt: &str) -> String {
@@ -290,13 +307,4 @@ fn xdg_screenshots_dir() -> Option<PathBuf> {
         }
     }
     None
-}
-
-fn ensure_tools(names: &[&str]) -> Result<()> {
-    for n in names {
-        if which(n).is_err() {
-            bail!("required tool not found in PATH: {}", n);
-        }
-    }
-    Ok(())
 }
