@@ -40,7 +40,7 @@ cargo build --release
 
 ```sh
 # Using an AUR helper
-yay -S crabture-git
+paru -S crabture-git
 ```
 
 ### System dependencies
