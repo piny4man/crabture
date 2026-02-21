@@ -15,7 +15,10 @@ use time::OffsetDateTime;
 use xcap::Monitor;
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Standalone screenshot tool — no external dependencies required")]
+#[command(
+    version,
+    about = "Standalone screenshot tool — no external dependencies required"
+)]
 struct Cli {
     /// Take immediate full-screen shot (no UI)
     #[arg(long)]
@@ -206,7 +209,9 @@ fn select_area() -> Result<image::RgbaImage> {
     // 1. Capture full screen
     let monitors = Monitor::all().context("failed to enumerate monitors")?;
     let monitor = monitors.into_iter().next().context("no monitors found")?;
-    let screenshot = monitor.capture_image().context("failed to capture screen")?;
+    let screenshot = monitor
+        .capture_image()
+        .context("failed to capture screen")?;
     let width = screenshot.width() as usize;
     let height = screenshot.height() as usize;
 
@@ -304,14 +309,9 @@ fn select_area() -> Result<image::RgbaImage> {
         if w < 2 || h < 2 {
             bail!("selection too small");
         }
-        let cropped = image::imageops::crop_imm(
-            &screenshot,
-            x as u32,
-            y as u32,
-            w as u32,
-            h as u32,
-        )
-        .to_image();
+        let cropped =
+            image::imageops::crop_imm(&screenshot, x as u32, y as u32, w as u32, h as u32)
+                .to_image();
         Ok(cropped)
     } else {
         bail!("selection cancelled (press Escape or close window)")
@@ -377,10 +377,7 @@ fn save_screenshot(
         }
         SaveHow::Save => {
             let path = save_to_file(img, shot_dir, format)?;
-            notify(
-                "Screenshot saved",
-                &format!("Saved to {}", path.display()),
-            );
+            notify("Screenshot saved", &format!("Saved to {}", path.display()));
         }
         SaveHow::CopyAndSave => {
             copy_to_clipboard(img)?;
