@@ -1,7 +1,7 @@
 # Maintainer: YOUR_NAME <you@example.com>
 pkgname=crabture-git
 _pkgname=crabture
-pkgver=0.2.0.r0.g0000000
+pkgver=0.2.1.r0.g0000000
 pkgrel=1
 pkgdesc='Standalone Linux screenshot tool — no external dependencies required. Supports X11 and Wayland.'
 arch=('x86_64' 'aarch64')
