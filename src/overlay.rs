@@ -168,9 +168,8 @@ impl OverlayState {
 
         // Interpret canvas as u32 slice for fast fills.
         // Safety: canvas is aligned and sized as wl_shm buffer (4-byte pixels).
-        let pixels: &mut [u32] = unsafe {
-            std::slice::from_raw_parts_mut(canvas.as_mut_ptr() as *mut u32, w * h)
-        };
+        let pixels: &mut [u32] =
+            unsafe { std::slice::from_raw_parts_mut(canvas.as_mut_ptr() as *mut u32, w * h) };
 
         // Fill entire surface with dark overlay.
         pixels.fill(OVERLAY_PIXEL);

@@ -93,7 +93,13 @@ fn main() -> Result<()> {
                 let scale = phys.height as f64 / log.height as f64;
                 println!(
                     "  Monitor {}: {} ({}x{} physical, {}x{} logical, scale {:.2})",
-                    i + 1, name, phys.width, phys.height, log.width, log.height, scale
+                    i + 1,
+                    name,
+                    phys.width,
+                    phys.height,
+                    log.width,
+                    log.height,
+                    scale
                 );
             }
         } else {
@@ -105,7 +111,11 @@ fn main() -> Result<()> {
                 let scale = m.scale_factor().unwrap_or(1.0);
                 println!(
                     "  Monitor {}: {} ({}x{}, scale {:.2})",
-                    i + 1, name, w, h, scale
+                    i + 1,
+                    name,
+                    w,
+                    h,
+                    scale
                 );
             }
         }
@@ -255,7 +265,9 @@ fn capture_fullscreen() -> Result<image::RgbaImage> {
     // Fall back to xcap (may be cropped on fractional scaling).
     let monitors = Monitor::all().context("failed to enumerate monitors")?;
     let monitor = monitors.into_iter().next().context("no monitors found")?;
-    Ok(monitor.capture_image().context("failed to capture screen")?)
+    Ok(monitor
+        .capture_image()
+        .context("failed to capture screen")?)
 }
 
 fn select_area() -> Result<image::RgbaImage> {
