@@ -26,6 +26,7 @@ jobs:
           libxcb1-dev
           libxcb-shm0-dev
           libxcb-randr0-dev
+          libxkbcommon-dev
 
       - name: Verify tag matches Cargo.toml version
         shell: bash

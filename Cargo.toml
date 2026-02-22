@@ -26,4 +26,12 @@ image = "0.25"
 arboard = { version = "3", features = ["image-data", "wayland-data-control"] }
 notify-rust = "4"
 dialoguer = "0.11"
-minifb = "0.27"
+
+# Wayland layer-shell overlay for area selection
+smithay-client-toolkit = { version = "0.20", default-features = false, features = ["xkbcommon"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+
+# Direct wlroots screencopy for full physical-resolution capture (bypasses
+# the XDG portal path in xcap which crops to logical resolution).
+libwayshot-xcap = "0.3"

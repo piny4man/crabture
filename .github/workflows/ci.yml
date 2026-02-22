@@ -23,6 +23,7 @@ jobs:
           libxcb1-dev
           libxcb-shm0-dev
           libxcb-randr0-dev
+          libxkbcommon-dev
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2

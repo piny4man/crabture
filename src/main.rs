@@ -2,17 +2,19 @@ use anyhow::{Context, Result, bail};
 use arboard::{Clipboard, ImageData};
 use clap::Parser;
 use dialoguer::{Input, Select, theme::ColorfulTheme};
-use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
 use notify_rust::Notification;
 use std::{
     borrow::Cow,
     env, fs,
     path::{Path, PathBuf},
+    process,
     thread::sleep,
     time::Duration,
 };
 use time::OffsetDateTime;
 use xcap::Monitor;
+
+mod overlay;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -36,10 +38,6 @@ struct Cli {
     #[arg(long)]
     region: Option<String>,
 
-    /// Use interactive TUI flow
-    #[arg(long)]
-    interactive: bool,
-
     /// Screenshot directory (default: XDG_SCREENSHOTS_DIR or ~/Pictures)
     dir: Option<PathBuf>,
 
@@ -54,6 +52,10 @@ struct Cli {
     /// List available monitors and exit
     #[arg(long)]
     list_monitors: bool,
+
+    /// Internal: daemon mode for clipboard persistence (do not use directly)
+    #[arg(long = "__clipboard-daemon", hide = true)]
+    clipboard_daemon: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -74,13 +76,48 @@ enum SaveHow {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Internal clipboard daemon mode: read image from temp file and serve it
+    // on the clipboard until another application overwrites it.
+    if let Some(ref path) = cli.clipboard_daemon {
+        return clipboard_daemon(path);
+    }
+
     if cli.list_monitors {
-        let monitors = Monitor::all().context("failed to enumerate monitors")?;
-        for (i, m) in monitors.iter().enumerate() {
-            let name = m.name().unwrap_or_else(|_| "unknown".into());
-            let w = m.width().unwrap_or(0);
-            let h = m.height().unwrap_or(0);
-            println!("  Monitor {}: {} ({}x{})", i + 1, name, w, h);
+        // Prefer libwayshot for accurate physical resolution on Wayland.
+        if let Ok(conn) = libwayshot_xcap::WayshotConnection::new() {
+            let outputs = conn.get_all_outputs();
+            for (i, o) in outputs.iter().enumerate() {
+                let name = &o.name;
+                let phys = o.physical_size;
+                let log = o.logical_region.inner.size;
+                let scale = phys.height as f64 / log.height as f64;
+                println!(
+                    "  Monitor {}: {} ({}x{} physical, {}x{} logical, scale {:.2})",
+                    i + 1,
+                    name,
+                    phys.width,
+                    phys.height,
+                    log.width,
+                    log.height,
+                    scale
+                );
+            }
+        } else {
+            let monitors = Monitor::all().context("failed to enumerate monitors")?;
+            for (i, m) in monitors.iter().enumerate() {
+                let name = m.name().unwrap_or_else(|_| "unknown".into());
+                let w = m.width().unwrap_or(0);
+                let h = m.height().unwrap_or(0);
+                let scale = m.scale_factor().unwrap_or(1.0);
+                println!(
+                    "  Monitor {}: {} ({}x{}, scale {:.2})",
+                    i + 1,
+                    name,
+                    w,
+                    h,
+                    scale
+                );
+            }
         }
         return Ok(());
     }
@@ -156,7 +193,15 @@ fn run_interactive(shot_dir: &Path, format: &str) -> Result<()> {
         let name = m.name().unwrap_or_else(|_| "unknown".into());
         let w = m.width().unwrap_or(0);
         let h = m.height().unwrap_or(0);
-        target_labels.push(format!("Monitor {}: {} ({}x{})", i + 1, name, w, h));
+        let scale = m.scale_factor().unwrap_or(1.0);
+        target_labels.push(format!(
+            "Monitor {}: {} ({}x{}, scale {:.2})",
+            i + 1,
+            name,
+            w,
+            h,
+            scale
+        ));
     }
 
     let target = Select::with_theme(&theme)
@@ -205,116 +250,67 @@ fn run_interactive(shot_dir: &Path, format: &str) -> Result<()> {
     save_screenshot(&img, how, shot_dir, format)
 }
 
-fn select_area() -> Result<image::RgbaImage> {
-    // 1. Capture full screen
+/// Capture the primary screen at full physical resolution using wlroots
+/// screencopy (via libwayshot-xcap).  Falls back to xcap if unavailable.
+fn capture_fullscreen() -> Result<image::RgbaImage> {
+    // Try wlroots screencopy first — returns full physical resolution.
+    if let Ok(conn) = libwayshot_xcap::WayshotConnection::new() {
+        let outputs = conn.get_all_outputs();
+        if let Some(output) = outputs.first()
+            && let Ok(img) = conn.screenshot_single_output(output, false)
+        {
+            return Ok(img.into_rgba8());
+        }
+    }
+    // Fall back to xcap (may be cropped on fractional scaling).
     let monitors = Monitor::all().context("failed to enumerate monitors")?;
     let monitor = monitors.into_iter().next().context("no monitors found")?;
-    let screenshot = monitor
-        .capture_image()
-        .context("failed to capture screen")?;
-    let width = screenshot.width() as usize;
-    let height = screenshot.height() as usize;
+    monitor.capture_image().context("failed to capture screen")
+}
 
-    // 2. Convert to minifb pixel format (0x00RRGGBB)
-    let original: Vec<u32> = screenshot
-        .pixels()
-        .map(|p| ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | (p[2] as u32))
-        .collect();
+fn select_area() -> Result<image::RgbaImage> {
+    // 1. Capture full screen at physical resolution.
+    let screenshot = capture_fullscreen()?;
+    let img_w = screenshot.width();
+    let img_h = screenshot.height();
 
-    let dark: Vec<u32> = screenshot
-        .pixels()
-        .map(|p| {
-            let r = (p[0] as u32) / 3;
-            let g = (p[1] as u32) / 3;
-            let b = (p[2] as u32) / 3;
-            (r << 16) | (g << 8) | b
-        })
-        .collect();
+    // 2. Run the Wayland layer-shell overlay for area selection.
+    // Returns (selection, surface_logical_size, render_scale).
+    let (selection, surf_size) =
+        overlay::run_selection_overlay().context("area selection failed")?;
 
-    let mut buffer = dark.clone();
-
-    // 3. Open borderless topmost window
-    let mut window = Window::new(
-        "",
-        width,
-        height,
-        WindowOptions {
-            borderless: true,
-            topmost: true,
-            title: false,
-            ..Default::default()
-        },
-    )
-    .context("failed to create selection window")?;
-
-    let mut start: Option<(usize, usize)> = None;
-    let mut selection: Option<(usize, usize, usize, usize)> = None;
-    let mut selecting = false;
-
-    // 4. Event loop: click and drag to select
-    while window.is_open() && !window.is_key_down(Key::Escape) {
-        if let Some((mx, my)) = window.get_mouse_pos(MouseMode::Clamp) {
-            let mx = (mx as usize).min(width.saturating_sub(1));
-            let my = (my as usize).min(height.saturating_sub(1));
-
-            if window.get_mouse_down(MouseButton::Left) {
-                if !selecting {
-                    start = Some((mx, my));
-                    selecting = true;
-                }
-
-                if let Some((sx, sy)) = start {
-                    let x1 = sx.min(mx);
-                    let y1 = sy.min(my);
-                    let x2 = sx.max(mx);
-                    let y2 = sy.max(my);
-                    selection = Some((x1, y1, x2.saturating_sub(x1), y2.saturating_sub(y1)));
-
-                    // Redraw: dark everywhere, bright in selection
-                    buffer.copy_from_slice(&dark);
-                    for row in y1..y2.min(height) {
-                        for col in x1..x2.min(width) {
-                            buffer[row * width + col] = original[row * width + col];
-                        }
-                    }
-
-                    // Draw border around selection
-                    let border_color: u32 = 0x00_FF_FF_FF;
-                    for col in x1..x2.min(width) {
-                        buffer[y1 * width + col] = border_color;
-                        if y2 > 0 && y2 - 1 < height {
-                            buffer[(y2 - 1) * width + col] = border_color;
-                        }
-                    }
-                    for row in y1..y2.min(height) {
-                        buffer[row * width + x1] = border_color;
-                        if x2 > 0 && x2 - 1 < width {
-                            buffer[row * width + x2 - 1] = border_color;
-                        }
-                    }
-                }
-            } else if selecting {
-                // Mouse released — selection complete
-                break;
+    match selection {
+        Some((sx, sy, sw, sh)) => {
+            if sw < 2 || sh < 2 {
+                bail!("selection too small");
             }
-        }
 
-        window
-            .update_with_buffer(&buffer, width, height)
-            .context("failed to update window")?;
-    }
+            // Pointer coords are in logical surface space (0..surface_w).
+            // The image is at physical resolution (img_w × img_h).
+            // Map: image_coord = logical_coord * img_w / surface_w.
+            // With render_scale = physical/logical and img at physical res:
+            //   img_w / surf_w ≈ render_scale, so this handles fractional
+            //   scaling automatically.
+            let (surf_w, surf_h) = surf_size;
+            let surf_w = if surf_w > 0 { surf_w } else { img_w };
+            let surf_h = if surf_h > 0 { surf_h } else { img_h };
+            let scale_x = img_w as f64 / surf_w as f64;
+            let scale_y = img_h as f64 / surf_h as f64;
+            let x = (sx as f64 * scale_x).round() as u32;
+            let y = (sy as f64 * scale_y).round() as u32;
+            let w = (sw as f64 * scale_x).round() as u32;
+            let h = (sh as f64 * scale_y).round() as u32;
 
-    // 5. Crop the original screenshot to the selection
-    if let Some((x, y, w, h)) = selection {
-        if w < 2 || h < 2 {
-            bail!("selection too small");
+            // Clamp to image bounds.
+            let x = x.min(img_w.saturating_sub(1));
+            let y = y.min(img_h.saturating_sub(1));
+            let w = w.min(img_w - x);
+            let h = h.min(img_h - y);
+
+            let cropped = image::imageops::crop_imm(&screenshot, x, y, w, h).to_image();
+            Ok(cropped)
         }
-        let cropped =
-            image::imageops::crop_imm(&screenshot, x as u32, y as u32, w as u32, h as u32)
-                .to_image();
-        Ok(cropped)
-    } else {
-        bail!("selection cancelled (press Escape or close window)")
+        None => bail!("selection cancelled"),
     }
 }
 
@@ -336,30 +332,36 @@ fn parse_region(s: &str) -> Result<CaptureKind> {
 }
 
 fn capture(kind: CaptureKind) -> Result<image::RgbaImage> {
-    let monitors = Monitor::all().context("failed to enumerate monitors")?;
-    if monitors.is_empty() {
-        bail!("no monitors found");
-    }
-
     match kind {
-        CaptureKind::Primary => monitors
-            .into_iter()
-            .next()
-            .unwrap()
-            .capture_image()
-            .context("failed to capture screen"),
-        CaptureKind::Monitor(idx) => monitors
-            .into_iter()
-            .nth(idx)
-            .context("monitor index out of range")?
-            .capture_image()
-            .context("failed to capture monitor"),
-        CaptureKind::Region { x, y, w, h } => monitors
-            .into_iter()
-            .next()
-            .unwrap()
-            .capture_region(x, y, w, h)
-            .context("failed to capture region"),
+        CaptureKind::Primary => capture_fullscreen(),
+        CaptureKind::Monitor(idx) => {
+            // Try libwayshot first for correct resolution.
+            if let Ok(conn) = libwayshot_xcap::WayshotConnection::new() {
+                let outputs = conn.get_all_outputs();
+                if let Some(output) = outputs.get(idx)
+                    && let Ok(img) = conn.screenshot_single_output(output, false)
+                {
+                    return Ok(img.into_rgba8());
+                }
+            }
+            // Fall back to xcap.
+            let monitors = Monitor::all().context("failed to enumerate monitors")?;
+            monitors
+                .into_iter()
+                .nth(idx)
+                .context("monitor index out of range")?
+                .capture_image()
+                .context("failed to capture monitor")
+        }
+        CaptureKind::Region { x, y, w, h } => {
+            // Capture full screen at physical resolution, then crop.
+            let img = capture_fullscreen()?;
+            let x = x.min(img.width().saturating_sub(1));
+            let y = y.min(img.height().saturating_sub(1));
+            let w = w.min(img.width() - x);
+            let h = h.min(img.height() - y);
+            Ok(image::imageops::crop_imm(&img, x, y, w, h).to_image())
+        }
         CaptureKind::Selection => select_area(),
     }
 }
@@ -392,15 +394,53 @@ fn save_screenshot(
 }
 
 fn copy_to_clipboard(img: &image::RgbaImage) -> Result<()> {
+    // On Wayland/X11 the clipboard is "owned" by the setting process.  When
+    // that process exits the content is lost.  To work around this we:
+    //   1. Write the image to a temp file.
+    //   2. Spawn a detached child of ourselves with `--__clipboard-daemon <path>`
+    //      that reads the file, puts it on the clipboard, and blocks (`.wait()`)
+    //      until something else is copied.
+    //   3. The parent returns immediately.
+    let tmp = env::temp_dir().join(format!("crabture_clip_{}.png", process::id()));
+    img.save(&tmp)
+        .context("failed to write clipboard temp file")?;
+
+    process::Command::new(env::current_exe().context("could not find own executable")?)
+        .arg("--__clipboard-daemon")
+        .arg(&tmp)
+        .stdin(process::Stdio::null())
+        .stdout(process::Stdio::null())
+        .stderr(process::Stdio::null())
+        .spawn()
+        .context("failed to spawn clipboard daemon")?;
+
+    Ok(())
+}
+
+/// Runs in the background child process: reads the image from `path`, places it
+/// on the clipboard, and blocks until another app overwrites it.
+fn clipboard_daemon(path: &Path) -> Result<()> {
+    use arboard::SetExtLinux;
+
+    let img = image::open(path)
+        .context("clipboard daemon: failed to read image")?
+        .into_rgba8();
+
+    // Clean up the temp file now that we have the data in memory.
+    fs::remove_file(path).ok();
+
     let mut clipboard = Clipboard::new().context("failed to open clipboard")?;
     let data = ImageData {
         width: img.width() as usize,
         height: img.height() as usize,
         bytes: Cow::Borrowed(img.as_raw()),
     };
+
     clipboard
-        .set_image(data)
-        .context("failed to copy image to clipboard")
+        .set()
+        .wait()
+        .image(data)
+        .context("failed to set clipboard image")
 }
 
 fn save_to_file(img: &image::RgbaImage, shot_dir: &Path, format: &str) -> Result<PathBuf> {
@@ -442,10 +482,10 @@ fn notify(title: &str, body: &str) {
 fn file_name(fmt: &str) -> String {
     let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
     let ts = format!(
-        "{:02}{:02}{:04}_{:02}{:02}{:02}",
-        now.day(),
-        now.month() as u8,
+        "{:04}{:02}{:02}_{:02}{:02}{:02}",
         now.year(),
+        now.month() as u8,
+        now.day(),
         now.hour(),
         now.minute(),
         now.second()
