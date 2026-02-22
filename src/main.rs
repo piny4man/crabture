@@ -256,18 +256,16 @@ fn capture_fullscreen() -> Result<image::RgbaImage> {
     // Try wlroots screencopy first — returns full physical resolution.
     if let Ok(conn) = libwayshot_xcap::WayshotConnection::new() {
         let outputs = conn.get_all_outputs();
-        if let Some(output) = outputs.first() {
-            if let Ok(img) = conn.screenshot_single_output(output, false) {
-                return Ok(img.into_rgba8());
-            }
+        if let Some(output) = outputs.first()
+            && let Ok(img) = conn.screenshot_single_output(output, false)
+        {
+            return Ok(img.into_rgba8());
         }
     }
     // Fall back to xcap (may be cropped on fractional scaling).
     let monitors = Monitor::all().context("failed to enumerate monitors")?;
     let monitor = monitors.into_iter().next().context("no monitors found")?;
-    Ok(monitor
-        .capture_image()
-        .context("failed to capture screen")?)
+    monitor.capture_image().context("failed to capture screen")
 }
 
 fn select_area() -> Result<image::RgbaImage> {
@@ -340,10 +338,10 @@ fn capture(kind: CaptureKind) -> Result<image::RgbaImage> {
             // Try libwayshot first for correct resolution.
             if let Ok(conn) = libwayshot_xcap::WayshotConnection::new() {
                 let outputs = conn.get_all_outputs();
-                if let Some(output) = outputs.get(idx) {
-                    if let Ok(img) = conn.screenshot_single_output(output, false) {
-                        return Ok(img.into_rgba8());
-                    }
+                if let Some(output) = outputs.get(idx)
+                    && let Ok(img) = conn.screenshot_single_output(output, false)
+                {
+                    return Ok(img.into_rgba8());
                 }
             }
             // Fall back to xcap.

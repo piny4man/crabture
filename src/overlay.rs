@@ -42,10 +42,17 @@ const CLEAR_PIXEL: u32 = 0x0000_0000;
 /// Border: solid white, premultiplied.
 const BORDER_PIXEL: u32 = 0xFFFF_FFFF;
 
+/// A rectangle in logical surface coordinates: (x, y, width, height).
+pub type SelectionRect = (u32, u32, u32, u32);
+
+/// Result of the overlay: an optional selection rectangle plus the surface
+/// dimensions `(width, height)`.
+pub type OverlayResult = (Option<SelectionRect>, (u32, u32));
+
 /// Run the fullscreen overlay and return `(selection, (surface_w, surface_h))`.
 /// `selection` is `Some((x, y, w, h))` in logical surface coordinates, or
 /// `None` if cancelled.
-pub fn run_selection_overlay() -> Result<(Option<(u32, u32, u32, u32)>, (u32, u32))> {
+pub fn run_selection_overlay() -> Result<OverlayResult> {
     let conn = Connection::connect_to_env().context("failed to connect to Wayland")?;
     let (globals, mut event_queue) =
         registry_queue_init(&conn).context("failed to initialise Wayland registry")?;
@@ -340,10 +347,10 @@ impl LayerShellHandler for OverlayState {
 
         // Allocate pool now that we know the surface size.
         let needed = self.surface_w as usize * self.surface_h as usize * 4 * 2;
-        if self.pool.len() < needed {
-            if let Ok(p) = SlotPool::new(needed, &self.shm) {
-                self.pool = p;
-            }
+        if self.pool.len() < needed
+            && let Ok(p) = SlotPool::new(needed, &self.shm)
+        {
+            self.pool = p;
         }
 
         if self.first_configure {
