@@ -17,7 +17,9 @@ use smithay_client_toolkit::{
     seat::{
         Capability, SeatHandler, SeatState,
         keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
-        pointer::{PointerEvent, PointerEventKind, PointerHandler},
+        pointer::{
+            PointerEvent, PointerEventKind, PointerHandler, cursor_shape::CursorShapeManager,
+        },
     },
     shell::{
         WaylandSurface,
@@ -33,6 +35,9 @@ use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
 };
+use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::{
+    Shape, WpCursorShapeDeviceV1,
+};
 
 /// Dark overlay: premultiplied ARGB, ~60% opacity black.
 /// In ARGB8888 little-endian (BGRA byte order): B=0, G=0, R=0, A=0x99.
@@ -45,13 +50,14 @@ const BORDER_PIXEL: u32 = 0xFFFF_FFFF;
 /// A rectangle in logical surface coordinates: (x, y, width, height).
 pub type SelectionRect = (u32, u32, u32, u32);
 
-/// Result of the overlay: an optional selection rectangle plus the surface
-/// dimensions `(width, height)`.
-pub type OverlayResult = (Option<SelectionRect>, (u32, u32));
+/// Result of the overlay: an optional selection rectangle, the surface
+/// dimensions `(width, height)`, and the name of the output the overlay was on.
+pub type OverlayResult = (Option<SelectionRect>, (u32, u32), Option<String>);
 
-/// Run the fullscreen overlay and return `(selection, (surface_w, surface_h))`.
+/// Run the fullscreen overlay and return `(selection, (surface_w, surface_h), output_name)`.
 /// `selection` is `Some((x, y, w, h))` in logical surface coordinates, or
-/// `None` if cancelled.
+/// `None` if cancelled.  `output_name` identifies which monitor the overlay
+/// appeared on (e.g. `"eDP-1"`).
 pub fn run_selection_overlay() -> Result<OverlayResult> {
     let conn = Connection::connect_to_env().context("failed to connect to Wayland")?;
     let (globals, mut event_queue) =
@@ -79,6 +85,9 @@ pub fn run_selection_overlay() -> Result<OverlayResult> {
 
     let pool = SlotPool::new(1024, &shm).context("failed to create shm pool")?;
 
+    // Optional: cursor shape protocol (not all compositors support it).
+    let cursor_shape_manager = CursorShapeManager::bind(&globals, &qh).ok();
+
     let mut state = OverlayState {
         registry_state: RegistryState::new(&globals),
         seat_state: SeatState::new(&globals, &qh),
@@ -88,6 +97,8 @@ pub fn run_selection_overlay() -> Result<OverlayResult> {
         layer,
         keyboard: None,
         pointer: None,
+        cursor_shape_manager,
+        cursor_shape_device: None,
 
         surface_w: 0,
         surface_h: 0,
@@ -96,6 +107,8 @@ pub fn run_selection_overlay() -> Result<OverlayResult> {
         start: None,
         current: None,
         selection: None,
+
+        output_name: None,
 
         dirty: false,
         frame_pending: false,
@@ -115,12 +128,13 @@ pub fn run_selection_overlay() -> Result<OverlayResult> {
     }
 
     let surf = (state.surface_w, state.surface_h);
+    let output_name = state.output_name;
 
     if state.cancelled {
-        return Ok((None, surf));
+        return Ok((None, surf, output_name));
     }
 
-    Ok((state.selection, surf))
+    Ok((state.selection, surf, output_name))
 }
 
 // ---------------------------------------------------------------------------
@@ -136,6 +150,8 @@ struct OverlayState {
     layer: LayerSurface,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
+    cursor_shape_manager: Option<CursorShapeManager>,
+    cursor_shape_device: Option<WpCursorShapeDeviceV1>,
 
     surface_w: u32,
     surface_h: u32,
@@ -144,6 +160,9 @@ struct OverlayState {
     start: Option<(f64, f64)>,
     current: Option<(f64, f64)>,
     selection: Option<(u32, u32, u32, u32)>,
+
+    /// Name of the output the overlay surface is on (e.g. "eDP-1", "HDMI-A-1").
+    output_name: Option<String>,
 
     /// True when the selection changed and we need a redraw.
     dirty: bool,
@@ -280,8 +299,13 @@ impl CompositorHandler for OverlayState {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _surface: &wl_surface::WlSurface,
-        _output: &wl_output::WlOutput,
+        output: &wl_output::WlOutput,
     ) {
+        // Record which output the overlay landed on so we can capture the
+        // correct monitor later.
+        if let Some(info) = self.output_state.info(output) {
+            self.output_name = info.name;
+        }
     }
 
     fn surface_leave(
@@ -386,6 +410,10 @@ impl SeatHandler for OverlayState {
                 .seat_state
                 .get_pointer(qh, &seat)
                 .expect("failed to get pointer");
+            // Create a cursor shape device so we can set a crosshair cursor.
+            if let Some(ref mgr) = self.cursor_shape_manager {
+                self.cursor_shape_device = Some(mgr.get_shape_device(&pointer, qh));
+            }
             self.pointer = Some(pointer);
         }
     }
@@ -501,6 +529,12 @@ impl PointerHandler for OverlayState {
             let ly = event.position.1;
 
             match event.kind {
+                PointerEventKind::Enter { serial } => {
+                    // Set crosshair cursor when entering the overlay surface.
+                    if let Some(ref device) = self.cursor_shape_device {
+                        device.set_shape(serial, Shape::Crosshair);
+                    }
+                }
                 PointerEventKind::Press { button, .. } => {
                     if button == 0x110 {
                         self.start = Some((lx, ly));

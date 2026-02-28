@@ -268,15 +268,47 @@ fn capture_fullscreen() -> Result<image::RgbaImage> {
     monitor.capture_image().context("failed to capture screen")
 }
 
+/// Capture every monitor individually, returning `(output_name, image)` pairs.
+/// Each screenshot is at the monitor's native physical resolution.
+fn capture_all_outputs() -> Result<Vec<(String, image::RgbaImage)>> {
+    // Try wlroots screencopy first — accurate physical resolution per output.
+    if let Ok(conn) = libwayshot_xcap::WayshotConnection::new() {
+        let outputs = conn.get_all_outputs();
+        let shots: Vec<_> = outputs
+            .iter()
+            .filter_map(|output| {
+                conn.screenshot_single_output(output, false)
+                    .ok()
+                    .map(|img| (output.name.clone(), img.into_rgba8()))
+            })
+            .collect();
+        if !shots.is_empty() {
+            return Ok(shots);
+        }
+    }
+
+    // Fall back to xcap.
+    let monitors = Monitor::all().context("failed to enumerate monitors")?;
+    let mut shots = Vec::with_capacity(monitors.len());
+    for m in &monitors {
+        let name = m.name().unwrap_or_else(|_| "unknown".into());
+        let img = m.capture_image().context("failed to capture monitor")?;
+        shots.push((name, img));
+    }
+    if shots.is_empty() {
+        bail!("no monitors found");
+    }
+    Ok(shots)
+}
+
 fn select_area() -> Result<image::RgbaImage> {
-    // 1. Capture full screen at physical resolution.
-    let screenshot = capture_fullscreen()?;
-    let img_w = screenshot.width();
-    let img_h = screenshot.height();
+    // 1. Capture every monitor at physical resolution before showing the
+    //    overlay (so the overlay itself is not in any screenshot).
+    let all_screenshots = capture_all_outputs()?;
 
     // 2. Run the Wayland layer-shell overlay for area selection.
-    // Returns (selection, surface_logical_size, render_scale).
-    let (selection, surf_size) =
+    //    Returns (selection, surface_logical_size, output_name).
+    let (selection, surf_size, output_name) =
         overlay::run_selection_overlay().context("area selection failed")?;
 
     match selection {
@@ -285,21 +317,50 @@ fn select_area() -> Result<image::RgbaImage> {
                 bail!("selection too small");
             }
 
+            // Pick the screenshot that matches the output the overlay was on.
+            // Fall back to the first screenshot if no match (shouldn't happen).
+            let screenshot = if let Some(ref target) = output_name {
+                all_screenshots
+                    .iter()
+                    .find(|(name, _)| name == target)
+                    .map_or(&all_screenshots[0].1, |(_, img)| img)
+            } else {
+                &all_screenshots[0].1
+            };
+
+            let img_w = screenshot.width();
+            let img_h = screenshot.height();
+
             // Pointer coords are in logical surface space (0..surface_w).
             // The image is at physical resolution (img_w × img_h).
             // Map: image_coord = logical_coord * img_w / surface_w.
-            // With render_scale = physical/logical and img at physical res:
-            //   img_w / surf_w ≈ render_scale, so this handles fractional
-            //   scaling automatically.
+            // This handles per-monitor resolution and fractional scaling
+            // automatically because both dimensions refer to the same output.
             let (surf_w, surf_h) = surf_size;
             let surf_w = if surf_w > 0 { surf_w } else { img_w };
             let surf_h = if surf_h > 0 { surf_h } else { img_h };
-            let scale_x = img_w as f64 / surf_w as f64;
-            let scale_y = img_h as f64 / surf_h as f64;
-            let x = (sx as f64 * scale_x).round() as u32;
-            let y = (sy as f64 * scale_y).round() as u32;
-            let w = (sw as f64 * scale_x).round() as u32;
-            let h = (sh as f64 * scale_y).round() as u32;
+            let scale_x = f64::from(img_w) / f64::from(surf_w);
+            let scale_y = f64::from(img_h) / f64::from(surf_h);
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "coordinates are non-negative and bounded by surface dimensions"
+            )]
+            let x = (f64::from(sx) * scale_x).round() as u32;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "coordinates are non-negative and bounded by surface dimensions"
+            )]
+            let y = (f64::from(sy) * scale_y).round() as u32;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "coordinates are non-negative and bounded by surface dimensions"
+            )]
+            let w = (f64::from(sw) * scale_x).round() as u32;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "coordinates are non-negative and bounded by surface dimensions"
+            )]
+            let h = (f64::from(sh) * scale_y).round() as u32;
 
             // Clamp to image bounds.
             let x = x.min(img_w.saturating_sub(1));
@@ -307,7 +368,7 @@ fn select_area() -> Result<image::RgbaImage> {
             let w = w.min(img_w - x);
             let h = h.min(img_h - y);
 
-            let cropped = image::imageops::crop_imm(&screenshot, x, y, w, h).to_image();
+            let cropped = image::imageops::crop_imm(screenshot, x, y, w, h).to_image();
             Ok(cropped)
         }
         None => bail!("selection cancelled"),
