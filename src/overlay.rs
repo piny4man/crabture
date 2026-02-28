@@ -18,8 +18,7 @@ use smithay_client_toolkit::{
         Capability, SeatHandler, SeatState,
         keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
         pointer::{
-            PointerEvent, PointerEventKind, PointerHandler,
-            cursor_shape::CursorShapeManager,
+            PointerEvent, PointerEventKind, PointerHandler, cursor_shape::CursorShapeManager,
         },
     },
     shell::{
@@ -37,7 +36,7 @@ use wayland_client::{
     protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
 };
 use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::{
-    WpCursorShapeDeviceV1, Shape,
+    Shape, WpCursorShapeDeviceV1,
 };
 
 /// Dark overlay: premultiplied ARGB, ~60% opacity black.
