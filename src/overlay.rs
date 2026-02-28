@@ -54,9 +54,10 @@ pub type SelectionRect = (u32, u32, u32, u32);
 /// dimensions `(width, height)`, and the name of the output the overlay was on.
 pub type OverlayResult = (Option<SelectionRect>, (u32, u32), Option<String>);
 
-/// Run the fullscreen overlay and return `(selection, (surface_w, surface_h))`.
+/// Run the fullscreen overlay and return `(selection, (surface_w, surface_h), output_name)`.
 /// `selection` is `Some((x, y, w, h))` in logical surface coordinates, or
-/// `None` if cancelled.
+/// `None` if cancelled.  `output_name` identifies which monitor the overlay
+/// appeared on (e.g. `"eDP-1"`).
 pub fn run_selection_overlay() -> Result<OverlayResult> {
     let conn = Connection::connect_to_env().context("failed to connect to Wayland")?;
     let (globals, mut event_queue) =

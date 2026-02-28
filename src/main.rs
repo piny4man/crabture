@@ -274,16 +274,16 @@ fn capture_all_outputs() -> Result<Vec<(String, image::RgbaImage)>> {
     // Try wlroots screencopy first — accurate physical resolution per output.
     if let Ok(conn) = libwayshot_xcap::WayshotConnection::new() {
         let outputs = conn.get_all_outputs();
-        if !outputs.is_empty() {
-            let mut shots = Vec::with_capacity(outputs.len());
-            for output in outputs {
-                if let Ok(img) = conn.screenshot_single_output(output, false) {
-                    shots.push((output.name.clone(), img.into_rgba8()));
-                }
-            }
-            if !shots.is_empty() {
-                return Ok(shots);
-            }
+        let shots: Vec<_> = outputs
+            .iter()
+            .filter_map(|output| {
+                conn.screenshot_single_output(output, false)
+                    .ok()
+                    .map(|img| (output.name.clone(), img.into_rgba8()))
+            })
+            .collect();
+        if !shots.is_empty() {
+            return Ok(shots);
         }
     }
 
@@ -323,8 +323,7 @@ fn select_area() -> Result<image::RgbaImage> {
                 all_screenshots
                     .iter()
                     .find(|(name, _)| name == target)
-                    .map(|(_, img)| img)
-                    .unwrap_or(&all_screenshots[0].1)
+                    .map_or(&all_screenshots[0].1, |(_, img)| img)
             } else {
                 &all_screenshots[0].1
             };
@@ -340,12 +339,16 @@ fn select_area() -> Result<image::RgbaImage> {
             let (surf_w, surf_h) = surf_size;
             let surf_w = if surf_w > 0 { surf_w } else { img_w };
             let surf_h = if surf_h > 0 { surf_h } else { img_h };
-            let scale_x = img_w as f64 / surf_w as f64;
-            let scale_y = img_h as f64 / surf_h as f64;
-            let x = (sx as f64 * scale_x).round() as u32;
-            let y = (sy as f64 * scale_y).round() as u32;
-            let w = (sw as f64 * scale_x).round() as u32;
-            let h = (sh as f64 * scale_y).round() as u32;
+            let scale_x = f64::from(img_w) / f64::from(surf_w);
+            let scale_y = f64::from(img_h) / f64::from(surf_h);
+            #[expect(clippy::cast_possible_truncation, reason = "coordinates are non-negative and bounded by surface dimensions")]
+            let x = (f64::from(sx) * scale_x).round() as u32;
+            #[expect(clippy::cast_possible_truncation, reason = "coordinates are non-negative and bounded by surface dimensions")]
+            let y = (f64::from(sy) * scale_y).round() as u32;
+            #[expect(clippy::cast_possible_truncation, reason = "coordinates are non-negative and bounded by surface dimensions")]
+            let w = (f64::from(sw) * scale_x).round() as u32;
+            #[expect(clippy::cast_possible_truncation, reason = "coordinates are non-negative and bounded by surface dimensions")]
+            let h = (f64::from(sh) * scale_y).round() as u32;
 
             // Clamp to image bounds.
             let x = x.min(img_w.saturating_sub(1));
