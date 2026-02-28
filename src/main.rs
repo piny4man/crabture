@@ -341,13 +341,25 @@ fn select_area() -> Result<image::RgbaImage> {
             let surf_h = if surf_h > 0 { surf_h } else { img_h };
             let scale_x = f64::from(img_w) / f64::from(surf_w);
             let scale_y = f64::from(img_h) / f64::from(surf_h);
-            #[expect(clippy::cast_possible_truncation, reason = "coordinates are non-negative and bounded by surface dimensions")]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "coordinates are non-negative and bounded by surface dimensions"
+            )]
             let x = (f64::from(sx) * scale_x).round() as u32;
-            #[expect(clippy::cast_possible_truncation, reason = "coordinates are non-negative and bounded by surface dimensions")]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "coordinates are non-negative and bounded by surface dimensions"
+            )]
             let y = (f64::from(sy) * scale_y).round() as u32;
-            #[expect(clippy::cast_possible_truncation, reason = "coordinates are non-negative and bounded by surface dimensions")]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "coordinates are non-negative and bounded by surface dimensions"
+            )]
             let w = (f64::from(sw) * scale_x).round() as u32;
-            #[expect(clippy::cast_possible_truncation, reason = "coordinates are non-negative and bounded by surface dimensions")]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "coordinates are non-negative and bounded by surface dimensions"
+            )]
             let h = (f64::from(sh) * scale_y).round() as u32;
 
             // Clamp to image bounds.
