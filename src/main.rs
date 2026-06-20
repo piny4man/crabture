@@ -15,6 +15,9 @@ use time::OffsetDateTime;
 use xcap::Monitor;
 
 mod overlay;
+mod session;
+
+use session::{CaptureSession, SessionOutcome};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -53,9 +56,22 @@ struct Cli {
     #[arg(long)]
     list_monitors: bool,
 
+    /// Show the legacy terminal menu instead of the graphical screenshot UI
+    #[arg(long)]
+    menu: bool,
+
     /// Internal: daemon mode for clipboard persistence (do not use directly)
     #[arg(long = "__clipboard-daemon", hide = true)]
     clipboard_daemon: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CliIntent {
+    Internal,
+    ListMonitors,
+    LegacyMenu,
+    DirectCapture,
+    GraphicalDefault,
 }
 
 #[derive(Clone, Debug)]
@@ -75,6 +91,7 @@ enum SaveHow {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let intent = cli_intent(&cli);
 
     // Internal clipboard daemon mode: read image from temp file and serve it
     // on the clipboard until another application overwrites it.
@@ -82,7 +99,7 @@ fn main() -> Result<()> {
         return clipboard_daemon(path);
     }
 
-    if cli.list_monitors {
+    if matches!(intent, CliIntent::ListMonitors) {
         // Prefer libwayshot for accurate physical resolution on Wayland.
         if let Ok(conn) = libwayshot_xcap::WayshotConnection::new() {
             let outputs = conn.get_all_outputs();
@@ -134,6 +151,12 @@ fn main() -> Result<()> {
         SaveHow::Save
     };
 
+    match intent {
+        CliIntent::GraphicalDefault => return run_graphical_screenshot_ui(),
+        CliIntent::LegacyMenu => return run_interactive(&shot_dir, &cli.format),
+        CliIntent::Internal | CliIntent::ListMonitors | CliIntent::DirectCapture => {}
+    }
+
     if cli.select {
         let img = select_area()?;
         return save_screenshot(&img, how, &shot_dir, &cli.format);
@@ -154,8 +177,34 @@ fn main() -> Result<()> {
         return save_screenshot(&img, how, &shot_dir, &cli.format);
     }
 
-    // default to interactive
-    run_interactive(&shot_dir, &cli.format)
+    run_graphical_screenshot_ui()
+}
+
+fn cli_intent(cli: &Cli) -> CliIntent {
+    if cli.clipboard_daemon.is_some() {
+        return CliIntent::Internal;
+    }
+    if cli.list_monitors {
+        return CliIntent::ListMonitors;
+    }
+    if cli.menu {
+        return CliIntent::LegacyMenu;
+    }
+    if cli.select || cli.region.is_some() || cli.instant || cli.monitor.is_some() {
+        return CliIntent::DirectCapture;
+    }
+    CliIntent::GraphicalDefault
+}
+
+fn run_graphical_screenshot_ui() -> Result<()> {
+    let mut session = CaptureSession::default();
+    let command = overlay::run_screenshot_hud(session.mode()).context("graphical UI failed")?;
+
+    match session.handle(command) {
+        SessionOutcome::Continue => Ok(()),
+        SessionOutcome::Cancelled => Ok(()),
+        SessionOutcome::Unsupported(message) => bail!(message),
+    }
 }
 
 fn run_interactive(shot_dir: &Path, format: &str) -> Result<()> {
@@ -581,4 +630,52 @@ fn xdg_screenshots_dir() -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::SessionCommand;
+
+    #[test]
+    fn no_arguments_launch_graphical_default() {
+        let cli = Cli::try_parse_from(["crabture"]).expect("valid cli");
+
+        assert_eq!(cli_intent(&cli), CliIntent::GraphicalDefault);
+    }
+
+    #[test]
+    fn explicit_direct_capture_flags_remain_direct() {
+        let cli = Cli::try_parse_from(["crabture", "--instant"]).expect("valid cli");
+        assert_eq!(cli_intent(&cli), CliIntent::DirectCapture);
+
+        let cli = Cli::try_parse_from(["crabture", "--select"]).expect("valid cli");
+        assert_eq!(cli_intent(&cli), CliIntent::DirectCapture);
+
+        let cli = Cli::try_parse_from(["crabture", "--region", "1,2,3x4"]).expect("valid cli");
+        assert_eq!(cli_intent(&cli), CliIntent::DirectCapture);
+    }
+
+    #[test]
+    fn cancel_has_no_capture_side_effect_intent() {
+        let mut session = CaptureSession::default();
+
+        assert_eq!(
+            session.handle(SessionCommand::Cancel),
+            SessionOutcome::Cancelled
+        );
+    }
+
+    #[test]
+    fn unimplemented_capture_reports_helpful_feedback() {
+        let mut session = CaptureSession::default();
+
+        assert_eq!(
+            session.handle(SessionCommand::Capture),
+            SessionOutcome::Unsupported(
+                "Area capture from the graphical toolbar is not implemented yet. Use --select for direct area capture."
+                    .to_string()
+            )
+        );
+    }
 }

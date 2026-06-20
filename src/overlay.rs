@@ -6,6 +6,7 @@
 //! border so the user can see the content underneath.
 //! Pointer click-drag selects the area; Escape or right-click cancels.
 
+use crate::session::{CaptureMode, SessionCommand};
 use anyhow::{Context, Result};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
@@ -46,6 +47,9 @@ const OVERLAY_PIXEL: u32 = 0x9900_0000;
 const CLEAR_PIXEL: u32 = 0x0000_0000;
 /// Border: solid white, premultiplied.
 const BORDER_PIXEL: u32 = 0xFFFF_FFFF;
+const HUD_PIXEL: u32 = 0xDD22_2222;
+const HUD_ACTIVE_PIXEL: u32 = 0xDD44_6688;
+const HUD_TEXT_PIXEL: u32 = 0xFFFF_FFFF;
 
 /// A rectangle in logical surface coordinates: (x, y, width, height).
 pub type SelectionRect = (u32, u32, u32, u32);
@@ -116,6 +120,8 @@ pub fn run_selection_overlay() -> Result<OverlayResult> {
         first_configure: true,
         exit: false,
         cancelled: false,
+        hud_mode: None,
+        hud_result: None,
     };
 
     loop {
@@ -135,6 +141,77 @@ pub fn run_selection_overlay() -> Result<OverlayResult> {
     }
 
     Ok((state.selection, surf, output_name))
+}
+
+pub fn run_screenshot_hud(default_mode: CaptureMode) -> Result<SessionCommand> {
+    let conn = Connection::connect_to_env().context("failed to connect to Wayland")?;
+    let (globals, mut event_queue) =
+        registry_queue_init(&conn).context("failed to initialise Wayland registry")?;
+    let qh = event_queue.handle();
+
+    let compositor = CompositorState::bind(&globals, &qh).context("wl_compositor not available")?;
+    let layer_shell = LayerShell::bind(&globals, &qh).context("wlr-layer-shell not available")?;
+    let shm = Shm::bind(&globals, &qh).context("wl_shm not available")?;
+
+    let surface = compositor.create_surface(&qh);
+
+    let layer =
+        layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("crabture-hud"), None);
+    layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+    layer.set_exclusive_zone(-1);
+    layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+    layer.set_size(0, 0);
+    layer.commit();
+
+    let pool = SlotPool::new(1024, &shm).context("failed to create shm pool")?;
+    let cursor_shape_manager = CursorShapeManager::bind(&globals, &qh).ok();
+
+    let mut state = OverlayState {
+        registry_state: RegistryState::new(&globals),
+        seat_state: SeatState::new(&globals, &qh),
+        output_state: OutputState::new(&globals, &qh),
+        shm,
+        pool,
+        layer,
+        keyboard: None,
+        pointer: None,
+        cursor_shape_manager,
+        cursor_shape_device: None,
+
+        surface_w: 0,
+        surface_h: 0,
+
+        selecting: false,
+        start: None,
+        current: None,
+        selection: None,
+
+        output_name: None,
+
+        dirty: false,
+        frame_pending: false,
+
+        first_configure: true,
+        exit: false,
+        cancelled: false,
+        hud_mode: Some(default_mode),
+        hud_result: None,
+    };
+
+    loop {
+        event_queue
+            .blocking_dispatch(&mut state)
+            .context("Wayland dispatch error")?;
+        if state.exit {
+            break;
+        }
+    }
+
+    if state.cancelled {
+        return Ok(SessionCommand::Cancel);
+    }
+
+    Ok(state.hud_result.unwrap_or(SessionCommand::Cancel))
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +249,8 @@ struct OverlayState {
     first_configure: bool,
     exit: bool,
     cancelled: bool,
+    hud_mode: Option<CaptureMode>,
+    hud_result: Option<SessionCommand>,
 }
 
 impl OverlayState {
@@ -197,39 +276,43 @@ impl OverlayState {
         let pixels: &mut [u32] =
             unsafe { std::slice::from_raw_parts_mut(canvas.as_mut_ptr() as *mut u32, w * h) };
 
-        // Fill entire surface with dark overlay.
-        pixels.fill(OVERLAY_PIXEL);
+        if let Some(mode) = self.hud_mode {
+            self.draw_hud(pixels, w, h, mode);
+        } else {
+            // Fill entire surface with dark overlay.
+            pixels.fill(OVERLAY_PIXEL);
 
-        // Draw selection rectangle at pointer coordinates.
-        if let (Some(start), Some(cur)) = (self.start, self.current) {
-            let x1 = (start.0.min(cur.0).round() as usize).min(w.saturating_sub(1));
-            let y1 = (start.1.min(cur.1).round() as usize).min(h.saturating_sub(1));
-            let x2 = (start.0.max(cur.0).round() as usize).min(w);
-            let y2 = (start.1.max(cur.1).round() as usize).min(h);
+            // Draw selection rectangle at pointer coordinates.
+            if let (Some(start), Some(cur)) = (self.start, self.current) {
+                let x1 = (start.0.min(cur.0).round() as usize).min(w.saturating_sub(1));
+                let y1 = (start.1.min(cur.1).round() as usize).min(h.saturating_sub(1));
+                let x2 = (start.0.max(cur.0).round() as usize).min(w);
+                let y2 = (start.1.max(cur.1).round() as usize).min(h);
 
-            if x2 > x1 && y2 > y1 {
-                // Clear the selection interior (transparent).
-                for row in y1..y2 {
-                    let start = row * w + x1;
-                    let end = row * w + x2;
-                    pixels[start..end].fill(CLEAR_PIXEL);
-                }
+                if x2 > x1 && y2 > y1 {
+                    // Clear the selection interior (transparent).
+                    for row in y1..y2 {
+                        let start = row * w + x1;
+                        let end = row * w + x2;
+                        pixels[start..end].fill(CLEAR_PIXEL);
+                    }
 
-                // White border (1px).
-                let top_start = y1 * w + x1;
-                let top_end = y1 * w + x2;
-                pixels[top_start..top_end].fill(BORDER_PIXEL);
+                    // White border (1px).
+                    let top_start = y1 * w + x1;
+                    let top_end = y1 * w + x2;
+                    pixels[top_start..top_end].fill(BORDER_PIXEL);
 
-                if y2 > y1 + 1 {
-                    let bot_start = (y2 - 1) * w + x1;
-                    let bot_end = (y2 - 1) * w + x2;
-                    pixels[bot_start..bot_end].fill(BORDER_PIXEL);
-                }
+                    if y2 > y1 + 1 {
+                        let bot_start = (y2 - 1) * w + x1;
+                        let bot_end = (y2 - 1) * w + x2;
+                        pixels[bot_start..bot_end].fill(BORDER_PIXEL);
+                    }
 
-                for row in y1..y2 {
-                    pixels[row * w + x1] = BORDER_PIXEL;
-                    if x2 > x1 + 1 {
-                        pixels[row * w + x2 - 1] = BORDER_PIXEL;
+                    for row in y1..y2 {
+                        pixels[row * w + x1] = BORDER_PIXEL;
+                        if x2 > x1 + 1 {
+                            pixels[row * w + x2 - 1] = BORDER_PIXEL;
+                        }
                     }
                 }
             }
@@ -254,6 +337,152 @@ impl OverlayState {
         }
 
         self.layer.commit();
+    }
+
+    fn draw_hud(&self, pixels: &mut [u32], w: usize, h: usize, mode: CaptureMode) {
+        pixels.fill(CLEAR_PIXEL);
+        for button in hud_buttons(w, h) {
+            let fill = if button.mode == Some(mode) {
+                HUD_ACTIVE_PIXEL
+            } else {
+                HUD_PIXEL
+            };
+            fill_rect(
+                pixels,
+                w,
+                button.x,
+                button.y,
+                button.width,
+                button.height,
+                fill,
+            );
+            draw_text(
+                pixels,
+                w,
+                button.x + 14,
+                button.y + 17,
+                button.label,
+                HUD_TEXT_PIXEL,
+            );
+        }
+    }
+}
+
+struct HudButton {
+    label: &'static str,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    command: SessionCommand,
+    mode: Option<CaptureMode>,
+}
+
+fn hud_buttons(w: usize, h: usize) -> [HudButton; 5] {
+    let widths = [72, 96, 72, 112, 96];
+    let gap = 8;
+    let total: usize = widths.iter().sum::<usize>() + gap * 4;
+    let x = w.saturating_sub(total) / 2;
+    let y = h.saturating_sub(76);
+
+    [
+        HudButton {
+            label: "AREA",
+            x,
+            y,
+            width: widths[0],
+            height: 44,
+            command: SessionCommand::SetMode(CaptureMode::Area),
+            mode: Some(CaptureMode::Area),
+        },
+        HudButton {
+            label: "WINDOW",
+            x: x + widths[0] + gap,
+            y,
+            width: widths[1],
+            height: 44,
+            command: SessionCommand::SetMode(CaptureMode::Window),
+            mode: Some(CaptureMode::Window),
+        },
+        HudButton {
+            label: "FULL",
+            x: x + widths[0] + widths[1] + gap * 2,
+            y,
+            width: widths[2],
+            height: 44,
+            command: SessionCommand::SetMode(CaptureMode::FullScreen),
+            mode: Some(CaptureMode::FullScreen),
+        },
+        HudButton {
+            label: "CAPTURE",
+            x: x + widths[0] + widths[1] + widths[2] + gap * 3,
+            y,
+            width: widths[3],
+            height: 44,
+            command: SessionCommand::Capture,
+            mode: None,
+        },
+        HudButton {
+            label: "CANCEL",
+            x: x + widths[0] + widths[1] + widths[2] + widths[3] + gap * 4,
+            y,
+            width: widths[4],
+            height: 44,
+            command: SessionCommand::Cancel,
+            mode: None,
+        },
+    ]
+}
+
+fn fill_rect(
+    pixels: &mut [u32],
+    surface_w: usize,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    pixel: u32,
+) {
+    for row in y..(y + height) {
+        let start = row * surface_w + x;
+        let end = start + width;
+        pixels[start..end].fill(pixel);
+    }
+}
+
+fn draw_text(pixels: &mut [u32], surface_w: usize, x: usize, y: usize, text: &str, pixel: u32) {
+    let mut cursor = x;
+    for ch in text.chars() {
+        draw_char(pixels, surface_w, cursor, y, ch, pixel);
+        cursor += 7;
+    }
+}
+
+fn draw_char(pixels: &mut [u32], surface_w: usize, x: usize, y: usize, ch: char, pixel: u32) {
+    let glyph = match ch {
+        'A' => [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
+        'C' => [0x0F, 0x10, 0x10, 0x10, 0x10, 0x10, 0x0F],
+        'D' => [0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E],
+        'E' => [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F],
+        'F' => [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10],
+        'I' => [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x1F],
+        'L' => [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F],
+        'N' => [0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11],
+        'O' => [0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
+        'P' => [0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10],
+        'R' => [0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11],
+        'T' => [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
+        'U' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
+        'W' => [0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11],
+        _ => [0, 0, 0, 0, 0, 0, 0],
+    };
+
+    for (row_idx, row) in glyph.iter().enumerate() {
+        for col in 0..5 {
+            if row & (1 << (4 - col)) != 0 {
+                pixels[(y + row_idx) * surface_w + x + col] = pixel;
+            }
+        }
     }
 }
 
@@ -466,11 +695,38 @@ impl KeyboardHandler for OverlayState {
     fn press_key(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
         _: u32,
         event: KeyEvent,
     ) {
+        if self.hud_mode.is_some() {
+            match event.keysym {
+                Keysym::Escape => {
+                    self.cancelled = true;
+                    self.exit = true;
+                }
+                Keysym::Return => {
+                    self.hud_result = Some(SessionCommand::Capture);
+                    self.exit = true;
+                }
+                Keysym::a | Keysym::A => {
+                    self.hud_mode = Some(CaptureMode::Area);
+                    self.draw(qh);
+                }
+                Keysym::w | Keysym::W => {
+                    self.hud_mode = Some(CaptureMode::Window);
+                    self.draw(qh);
+                }
+                Keysym::f | Keysym::F => {
+                    self.hud_mode = Some(CaptureMode::FullScreen);
+                    self.draw(qh);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         if event.keysym == Keysym::Escape {
             self.cancelled = true;
             self.exit = true;
@@ -536,6 +792,43 @@ impl PointerHandler for OverlayState {
                     }
                 }
                 PointerEventKind::Press { button, .. } => {
+                    if self.hud_mode.is_some() {
+                        if button == 0x110 {
+                            let x = lx.round() as usize;
+                            let y = ly.round() as usize;
+                            for hud_button in
+                                hud_buttons(self.surface_w as usize, self.surface_h as usize)
+                            {
+                                let inside_x =
+                                    x >= hud_button.x && x < hud_button.x + hud_button.width;
+                                let inside_y =
+                                    y >= hud_button.y && y < hud_button.y + hud_button.height;
+                                if inside_x && inside_y {
+                                    match hud_button.command {
+                                        SessionCommand::SetMode(mode) => {
+                                            self.hud_mode = Some(mode);
+                                            self.draw(qh);
+                                        }
+                                        SessionCommand::Capture => {
+                                            self.hud_result = Some(SessionCommand::Capture);
+                                            self.exit = true;
+                                        }
+                                        SessionCommand::Cancel => {
+                                            self.cancelled = true;
+                                            self.exit = true;
+                                        }
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                        if button == 0x111 {
+                            self.cancelled = true;
+                            self.exit = true;
+                        }
+                        return;
+                    }
+
                     if button == 0x110 {
                         self.start = Some((lx, ly));
                         self.current = Some((lx, ly));
@@ -563,11 +856,9 @@ impl PointerHandler for OverlayState {
                         return;
                     }
                 }
-                PointerEventKind::Motion { .. } => {
-                    if self.selecting {
-                        self.current = Some((lx, ly));
-                        needs_redraw = true;
-                    }
+                PointerEventKind::Motion { .. } if self.selecting => {
+                    self.current = Some((lx, ly));
+                    needs_redraw = true;
                 }
                 _ => {}
             }

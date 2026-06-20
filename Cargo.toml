@@ -1,6 +1,6 @@
 [package]
 name = "crabture"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2024"
 description = "Standalone Linux screenshot tool — no external dependencies required. Supports X11 and Wayland."
 license = "GPL-3.0-only"
