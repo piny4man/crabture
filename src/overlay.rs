@@ -7,8 +7,8 @@
 //! Pointer click-drag selects the area; Escape or right-click cancels.
 
 use crate::session::{
-    AreaSelection, CaptureMode, GraphicalPreferences, OutputDestination, SaveLocationChoice,
-    SessionCommand,
+    AreaSelection, CaptureMode, FullScreenSelection, GraphicalPreferences, OutputDestination,
+    SaveLocationChoice, SessionCommand,
 };
 use anyhow::{Context, Result};
 use smithay_client_toolkit::{
@@ -220,6 +220,13 @@ fn capture_area_command(
     )
 }
 
+fn capture_full_screen_command(
+    output_name: Option<String>,
+    preferences: GraphicalPreferences,
+) -> SessionCommand {
+    SessionCommand::CaptureFullScreen(FullScreenSelection { output_name }, preferences)
+}
+
 /// Run the fullscreen overlay and return `(selection, (surface_w, surface_h), output_name)`.
 /// `selection` is `Some((x, y, w, h))` in logical surface coordinates, or
 /// `None` if cancelled.  `output_name` identifies which monitor the overlay
@@ -423,15 +430,23 @@ struct OverlayState {
 
 impl OverlayState {
     fn capture_or_error_command(&self) -> SessionCommand {
-        if let Some(rect) = self.selection {
-            capture_area_command(
-                rect,
-                (self.surface_w, self.surface_h),
-                self.output_name.clone(),
-                self.preferences,
-            )
-        } else {
-            SessionCommand::Capture
+        match self.preferences.mode {
+            CaptureMode::Area => {
+                if let Some(rect) = self.selection {
+                    capture_area_command(
+                        rect,
+                        (self.surface_w, self.surface_h),
+                        self.output_name.clone(),
+                        self.preferences,
+                    )
+                } else {
+                    SessionCommand::Capture
+                }
+            }
+            CaptureMode::FullScreen => {
+                capture_full_screen_command(self.output_name.clone(), self.preferences)
+            }
+            CaptureMode::Window => SessionCommand::Capture,
         }
     }
 
@@ -1075,7 +1090,8 @@ impl PointerHandler for OverlayState {
                                             self.cancelled = true;
                                             self.exit = true;
                                         }
-                                        SessionCommand::CaptureArea(_, _) => {}
+                                        SessionCommand::CaptureArea(_, _)
+                                        | SessionCommand::CaptureFullScreen(_, _) => {}
                                     }
                                     return;
                                 }
@@ -1240,6 +1256,24 @@ mod tests {
         assert_eq!(
             selection_rect_from_drag((20.0, 30.0), (100.0, 80.0)),
             (20, 30, 80, 50)
+        );
+    }
+
+    #[test]
+    fn full_screen_command_carries_output_identity() {
+        let preferences = GraphicalPreferences {
+            mode: CaptureMode::FullScreen,
+            ..GraphicalPreferences::default()
+        };
+
+        assert_eq!(
+            capture_full_screen_command(Some("eDP-1".to_string()), preferences),
+            SessionCommand::CaptureFullScreen(
+                FullScreenSelection {
+                    output_name: Some("eDP-1".to_string()),
+                },
+                preferences
+            )
         );
     }
 

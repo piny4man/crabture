@@ -18,8 +18,8 @@ mod overlay;
 mod session;
 
 use session::{
-    AreaSelection, CaptureSession, GraphicalFormat, GraphicalPreferences, OutputDestination,
-    SaveLocationChoice, SessionOutcome,
+    AreaSelection, CaptureSession, FullScreenSelection, GraphicalFormat, GraphicalPreferences,
+    OutputDestination, SaveLocationChoice, SessionOutcome,
 };
 
 #[derive(Parser, Debug)]
@@ -233,6 +233,11 @@ fn run_graphical_screenshot_ui() -> Result<()> {
             save_graphical_preferences(&preferences).ok();
             let img = selected_area_image(&all_screenshots, &selection)?;
             save_graphical_capture(&img, preferences)
+        }
+        SessionOutcome::CaptureFullScreen(selection, preferences) => {
+            save_graphical_preferences(&preferences).ok();
+            let img = selected_full_screen_image(&all_screenshots, &selection)?;
+            save_graphical_capture(img, preferences)
         }
         SessionOutcome::Unsupported(message) => bail!(message),
     }
@@ -523,6 +528,23 @@ fn selected_area_image(
     );
 
     Ok(image::imageops::crop_imm(screenshot, crop.x, crop.y, crop.w, crop.h).to_image())
+}
+
+fn selected_full_screen_image<'a>(
+    all_screenshots: &'a [(String, image::RgbaImage)],
+    selection: &FullScreenSelection,
+) -> Result<&'a image::RgbaImage> {
+    if all_screenshots.is_empty() {
+        bail!("no monitors found");
+    }
+
+    if let Some(ref target) = selection.output_name
+        && let Some((_, img)) = all_screenshots.iter().find(|(name, _)| name == target)
+    {
+        return Ok(img);
+    }
+
+    Ok(&all_screenshots[0].1)
 }
 
 fn map_selection_to_physical_crop(
@@ -836,17 +858,54 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_capture_reports_helpful_feedback() {
+    fn graphical_full_screen_capture_selects_named_output() {
+        let first = image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 0, 0, 255]));
+        let second = image::RgbaImage::from_pixel(3, 3, image::Rgba([2, 0, 0, 255]));
+        let screenshots = vec![
+            ("HDMI-A-1".to_string(), first),
+            ("eDP-1".to_string(), second),
+        ];
+
+        let selected = selected_full_screen_image(
+            &screenshots,
+            &FullScreenSelection {
+                output_name: Some("eDP-1".to_string()),
+            },
+        )
+        .expect("selects target output");
+
+        assert_eq!(selected.dimensions(), (3, 3));
+    }
+
+    #[test]
+    fn graphical_full_screen_capture_falls_back_to_first_output() {
+        let first = image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 0, 0, 255]));
+        let second = image::RgbaImage::from_pixel(3, 3, image::Rgba([2, 0, 0, 255]));
+        let screenshots = vec![
+            ("HDMI-A-1".to_string(), first),
+            ("eDP-1".to_string(), second),
+        ];
+
+        let selected = selected_full_screen_image(
+            &screenshots,
+            &FullScreenSelection {
+                output_name: Some("unknown".to_string()),
+            },
+        )
+        .expect("falls back to first output");
+
+        assert_eq!(selected.dimensions(), (2, 2));
+    }
+
+    #[test]
+    fn graphical_window_capture_reports_helpful_feedback() {
         let mut session = CaptureSession::default();
-        session.handle(SessionCommand::SetMode(
-            crate::session::CaptureMode::FullScreen,
-        ));
+        session.handle(SessionCommand::SetMode(crate::session::CaptureMode::Window));
 
         assert_eq!(
             session.handle(SessionCommand::Capture),
             SessionOutcome::Unsupported(
-                "Full screen capture from the graphical toolbar is not implemented yet. Use --instant for direct full-screen capture."
-                    .to_string()
+                "Window capture from the graphical toolbar is not implemented yet.".to_string()
             )
         );
     }

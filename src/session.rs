@@ -5,6 +5,11 @@ pub struct AreaSelection {
     pub output_name: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FullScreenSelection {
+    pub output_name: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputDestination {
     Clipboard,
@@ -132,6 +137,7 @@ pub enum SessionCommand {
     SetFormat(GraphicalFormat),
     SetLocation(SaveLocationChoice),
     CaptureArea(AreaSelection, GraphicalPreferences),
+    CaptureFullScreen(FullScreenSelection, GraphicalPreferences),
     Capture,
     Cancel,
 }
@@ -141,6 +147,7 @@ pub enum SessionOutcome {
     Continue,
     Cancelled,
     CaptureArea(AreaSelection, GraphicalPreferences),
+    CaptureFullScreen(FullScreenSelection, GraphicalPreferences),
     Unsupported(String),
 }
 
@@ -199,6 +206,15 @@ impl CaptureSession {
             SessionCommand::CaptureArea(_, _) => {
                 SessionOutcome::Unsupported(self.unsupported_message())
             }
+            SessionCommand::CaptureFullScreen(selection, preferences)
+                if self.preferences.mode == CaptureMode::FullScreen =>
+            {
+                self.preferences = preferences;
+                SessionOutcome::CaptureFullScreen(selection, preferences)
+            }
+            SessionCommand::CaptureFullScreen(_, _) => {
+                SessionOutcome::Unsupported(self.unsupported_message())
+            }
             SessionCommand::Cancel => SessionOutcome::Cancelled,
             SessionCommand::Capture if self.preferences.mode == CaptureMode::Area => {
                 SessionOutcome::Unsupported("Draw an area before capturing.".to_string())
@@ -211,7 +227,7 @@ impl CaptureSession {
         match self.preferences.mode {
             CaptureMode::Area => "Area capture from the graphical toolbar is not implemented yet. Use --select for direct area capture.",
             CaptureMode::Window => "Window capture from the graphical toolbar is not implemented yet.",
-            CaptureMode::FullScreen => "Full screen capture from the graphical toolbar is not implemented yet. Use --instant for direct full-screen capture.",
+            CaptureMode::FullScreen => "Full screen capture could not determine a target display.",
         }
         .to_string()
     }
@@ -262,6 +278,26 @@ mod tests {
         assert_eq!(
             session.handle(SessionCommand::CaptureArea(selection.clone(), preferences)),
             SessionOutcome::CaptureArea(selection, preferences)
+        );
+    }
+
+    #[test]
+    fn full_screen_capture_requests_current_output() {
+        let mut session = CaptureSession::with_preferences(GraphicalPreferences {
+            mode: CaptureMode::FullScreen,
+            ..GraphicalPreferences::default()
+        });
+        let selection = FullScreenSelection {
+            output_name: Some("eDP-1".to_string()),
+        };
+        let preferences = session.preferences();
+
+        assert_eq!(
+            session.handle(SessionCommand::CaptureFullScreen(
+                selection.clone(),
+                preferences
+            )),
+            SessionOutcome::CaptureFullScreen(selection, preferences)
         );
     }
 
