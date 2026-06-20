@@ -6,7 +6,7 @@
 //! border so the user can see the content underneath.
 //! Pointer click-drag selects the area; Escape or right-click cancels.
 
-use crate::session::{CaptureMode, SessionCommand};
+use crate::session::{AreaSelection, CaptureMode, SessionCommand};
 use anyhow::{Context, Result};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
@@ -292,39 +292,7 @@ impl OverlayState {
             pixels.fill(OVERLAY_PIXEL);
 
             // Draw selection rectangle at pointer coordinates.
-            if let (Some(start), Some(cur)) = (self.start, self.current) {
-                let x1 = (start.0.min(cur.0).round() as usize).min(w.saturating_sub(1));
-                let y1 = (start.1.min(cur.1).round() as usize).min(h.saturating_sub(1));
-                let x2 = (start.0.max(cur.0).round() as usize).min(w);
-                let y2 = (start.1.max(cur.1).round() as usize).min(h);
-
-                if x2 > x1 && y2 > y1 {
-                    // Clear the selection interior (transparent).
-                    for row in y1..y2 {
-                        let start = row * w + x1;
-                        let end = row * w + x2;
-                        pixels[start..end].fill(CLEAR_PIXEL);
-                    }
-
-                    // White border (1px).
-                    let top_start = y1 * w + x1;
-                    let top_end = y1 * w + x2;
-                    pixels[top_start..top_end].fill(BORDER_PIXEL);
-
-                    if y2 > y1 + 1 {
-                        let bot_start = (y2 - 1) * w + x1;
-                        let bot_end = (y2 - 1) * w + x2;
-                        pixels[bot_start..bot_end].fill(BORDER_PIXEL);
-                    }
-
-                    for row in y1..y2 {
-                        pixels[row * w + x1] = BORDER_PIXEL;
-                        if x2 > x1 + 1 {
-                            pixels[row * w + x2 - 1] = BORDER_PIXEL;
-                        }
-                    }
-                }
-            }
+            draw_selection(pixels, w, h, self.start, self.current);
         }
 
         self.layer.wl_surface().set_buffer_scale(1);
@@ -349,7 +317,12 @@ impl OverlayState {
     }
 
     fn draw_hud(&self, pixels: &mut [u32], w: usize, h: usize, mode: CaptureMode) {
-        pixels.fill(CLEAR_PIXEL);
+        if mode == CaptureMode::Area {
+            pixels.fill(OVERLAY_PIXEL);
+            draw_selection(pixels, w, h, self.start, self.current);
+        } else {
+            pixels.fill(CLEAR_PIXEL);
+        }
         for button in hud_buttons(w, h) {
             let fill = if button.mode == Some(mode) {
                 HUD_ACTIVE_PIXEL
@@ -373,6 +346,46 @@ impl OverlayState {
                 button.label,
                 HUD_TEXT_PIXEL,
             );
+        }
+    }
+}
+
+fn draw_selection(
+    pixels: &mut [u32],
+    w: usize,
+    h: usize,
+    start: Option<(f64, f64)>,
+    current: Option<(f64, f64)>,
+) {
+    if let (Some(start), Some(cur)) = (start, current) {
+        let x1 = (start.0.min(cur.0).round() as usize).min(w.saturating_sub(1));
+        let y1 = (start.1.min(cur.1).round() as usize).min(h.saturating_sub(1));
+        let x2 = (start.0.max(cur.0).round() as usize).min(w);
+        let y2 = (start.1.max(cur.1).round() as usize).min(h);
+
+        if x2 > x1 && y2 > y1 {
+            for row in y1..y2 {
+                let start = row * w + x1;
+                let end = row * w + x2;
+                pixels[start..end].fill(CLEAR_PIXEL);
+            }
+
+            let top_start = y1 * w + x1;
+            let top_end = y1 * w + x2;
+            pixels[top_start..top_end].fill(BORDER_PIXEL);
+
+            if y2 > y1 + 1 {
+                let bot_start = (y2 - 1) * w + x1;
+                let bot_end = (y2 - 1) * w + x2;
+                pixels[bot_start..bot_end].fill(BORDER_PIXEL);
+            }
+
+            for row in y1..y2 {
+                pixels[row * w + x1] = BORDER_PIXEL;
+                if x2 > x1 + 1 {
+                    pixels[row * w + x2 - 1] = BORDER_PIXEL;
+                }
+            }
         }
     }
 }
@@ -801,7 +814,7 @@ impl PointerHandler for OverlayState {
                     }
                 }
                 PointerEventKind::Press { button, .. } => {
-                    if self.hud_mode.is_some() {
+                    if let Some(mode) = self.hud_mode {
                         if button == 0x110 {
                             let x = lx.round() as usize;
                             let y = ly.round() as usize;
@@ -826,9 +839,16 @@ impl PointerHandler for OverlayState {
                                             self.cancelled = true;
                                             self.exit = true;
                                         }
+                                        SessionCommand::CaptureArea(_) => {}
                                     }
                                     return;
                                 }
+                            }
+                            if mode == CaptureMode::Area {
+                                self.start = Some((lx, ly));
+                                self.current = Some((lx, ly));
+                                self.selecting = true;
+                                self.draw(qh);
                             }
                         }
                         if button == 0x111 {
@@ -853,7 +873,16 @@ impl PointerHandler for OverlayState {
                 PointerEventKind::Release { button, .. } => {
                     if button == 0x110 && self.selecting {
                         if let (Some((sx, sy)), Some((cx, cy))) = (self.start, self.current) {
-                            self.selection = Some(selection_rect_from_drag((sx, sy), (cx, cy)));
+                            let rect = selection_rect_from_drag((sx, sy), (cx, cy));
+                            self.selection = Some(rect);
+                            if self.hud_mode == Some(CaptureMode::Area) {
+                                self.hud_result =
+                                    Some(SessionCommand::CaptureArea(AreaSelection {
+                                        rect,
+                                        surface_size: (self.surface_w, self.surface_h),
+                                        output_name: self.output_name.clone(),
+                                    }));
+                            }
                         }
                         self.selecting = false;
                         self.exit = true;

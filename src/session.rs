@@ -1,3 +1,10 @@
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AreaSelection {
+    pub rect: (u32, u32, u32, u32),
+    pub surface_size: (u32, u32),
+    pub output_name: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureMode {
     Area,
@@ -8,6 +15,7 @@ pub enum CaptureMode {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionCommand {
     SetMode(CaptureMode),
+    CaptureArea(AreaSelection),
     Capture,
     Cancel,
 }
@@ -16,7 +24,7 @@ pub enum SessionCommand {
 pub enum SessionOutcome {
     Continue,
     Cancelled,
-    CaptureAreaToClipboard,
+    CaptureAreaToClipboard(AreaSelection),
     Unsupported(String),
 }
 
@@ -49,9 +57,15 @@ impl CaptureSession {
                 self.mode = mode;
                 SessionOutcome::Continue
             }
+            SessionCommand::CaptureArea(selection) if self.mode == CaptureMode::Area => {
+                SessionOutcome::CaptureAreaToClipboard(selection)
+            }
+            SessionCommand::CaptureArea(_) => {
+                SessionOutcome::Unsupported(self.unsupported_message())
+            }
             SessionCommand::Cancel => SessionOutcome::Cancelled,
             SessionCommand::Capture if self.mode == CaptureMode::Area => {
-                SessionOutcome::CaptureAreaToClipboard
+                SessionOutcome::Unsupported("Draw an area before capturing.".to_string())
             }
             SessionCommand::Capture => SessionOutcome::Unsupported(self.unsupported_message()),
         }
@@ -93,10 +107,25 @@ mod tests {
     #[test]
     fn area_capture_requests_clipboard_output() {
         let mut session = CaptureSession::default();
+        let selection = AreaSelection {
+            rect: (10, 20, 30, 40),
+            surface_size: (800, 600),
+            output_name: Some("eDP-1".to_string()),
+        };
+
+        assert_eq!(
+            session.handle(SessionCommand::CaptureArea(selection.clone())),
+            SessionOutcome::CaptureAreaToClipboard(selection)
+        );
+    }
+
+    #[test]
+    fn area_capture_requires_a_drawn_selection() {
+        let mut session = CaptureSession::default();
 
         assert_eq!(
             session.handle(SessionCommand::Capture),
-            SessionOutcome::CaptureAreaToClipboard
+            SessionOutcome::Unsupported("Draw an area before capturing.".to_string())
         );
     }
 

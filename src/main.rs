@@ -17,7 +17,7 @@ use xcap::Monitor;
 mod overlay;
 mod session;
 
-use session::{CaptureSession, SessionOutcome};
+use session::{AreaSelection, CaptureSession, SessionOutcome};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -223,13 +223,14 @@ fn cli_intent(cli: &Cli) -> CliIntent {
 
 fn run_graphical_screenshot_ui() -> Result<()> {
     let mut session = CaptureSession::default();
+    let all_screenshots = capture_all_outputs()?;
     let command = overlay::run_screenshot_hud(session.mode()).context("graphical UI failed")?;
 
     match session.handle(command) {
         SessionOutcome::Continue => Ok(()),
         SessionOutcome::Cancelled => Ok(()),
-        SessionOutcome::CaptureAreaToClipboard => {
-            let img = select_area()?;
+        SessionOutcome::CaptureAreaToClipboard(selection) => {
+            let img = selected_area_image(&all_screenshots, &selection)?;
             save_graphical_capture(&img, default_graphical_output())
         }
         SessionOutcome::Unsupported(message) => bail!(message),
@@ -404,34 +405,45 @@ fn select_area() -> Result<image::RgbaImage> {
         overlay::run_selection_overlay().context("area selection failed")?;
 
     match selection {
-        Some((sx, sy, sw, sh)) => {
-            if sw < 2 || sh < 2 {
-                bail!("selection too small");
-            }
-
-            // Pick the screenshot that matches the output the overlay was on.
-            // Fall back to the first screenshot if no match (shouldn't happen).
-            let screenshot = if let Some(ref target) = output_name {
-                all_screenshots
-                    .iter()
-                    .find(|(name, _)| name == target)
-                    .map_or(&all_screenshots[0].1, |(_, img)| img)
-            } else {
-                &all_screenshots[0].1
-            };
-
-            let crop = map_selection_to_physical_crop(
-                (sx, sy, sw, sh),
-                surf_size,
-                (screenshot.width(), screenshot.height()),
-            );
-
-            let cropped =
-                image::imageops::crop_imm(screenshot, crop.x, crop.y, crop.w, crop.h).to_image();
-            Ok(cropped)
-        }
+        Some(rect) => selected_area_image(
+            &all_screenshots,
+            &AreaSelection {
+                rect,
+                surface_size: surf_size,
+                output_name,
+            },
+        ),
         None => bail!("selection cancelled"),
     }
+}
+
+fn selected_area_image(
+    all_screenshots: &[(String, image::RgbaImage)],
+    selection: &AreaSelection,
+) -> Result<image::RgbaImage> {
+    let (sx, sy, sw, sh) = selection.rect;
+    if sw < 2 || sh < 2 {
+        bail!("selection too small");
+    }
+
+    // Pick the screenshot that matches the output the overlay was on.
+    // Fall back to the first screenshot if no match (shouldn't happen).
+    let screenshot = if let Some(ref target) = selection.output_name {
+        all_screenshots
+            .iter()
+            .find(|(name, _)| name == target)
+            .map_or(&all_screenshots[0].1, |(_, img)| img)
+    } else {
+        &all_screenshots[0].1
+    };
+
+    let crop = map_selection_to_physical_crop(
+        (sx, sy, sw, sh),
+        selection.surface_size,
+        (screenshot.width(), screenshot.height()),
+    );
+
+    Ok(image::imageops::crop_imm(screenshot, crop.x, crop.y, crop.w, crop.h).to_image())
 }
 
 fn map_selection_to_physical_crop(
@@ -814,7 +826,11 @@ mod tests {
 
         assert_ne!(
             session.handle(SessionCommand::Cancel),
-            SessionOutcome::CaptureAreaToClipboard
+            SessionOutcome::CaptureAreaToClipboard(AreaSelection {
+                rect: (1, 1, 2, 2),
+                surface_size: (10, 10),
+                output_name: None,
+            })
         );
     }
 }
