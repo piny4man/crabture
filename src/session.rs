@@ -6,6 +6,119 @@ pub struct AreaSelection {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutputDestination {
+    Clipboard,
+    Save,
+    CopyAndSave,
+}
+
+impl OutputDestination {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Clipboard => Self::Save,
+            Self::Save => Self::CopyAndSave,
+            Self::CopyAndSave => Self::Clipboard,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Clipboard => "clipboard",
+            Self::Save => "save",
+            Self::CopyAndSave => "copy_and_save",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "clipboard" => Some(Self::Clipboard),
+            "save" => Some(Self::Save),
+            "copy_and_save" => Some(Self::CopyAndSave),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GraphicalFormat {
+    Png,
+    Jpg,
+}
+
+impl GraphicalFormat {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Png => Self::Jpg,
+            Self::Jpg => Self::Png,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpg => "jpg",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "png" => Some(Self::Png),
+            "jpg" | "jpeg" => Some(Self::Jpg),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SaveLocationChoice {
+    Screenshots,
+    CurrentDirectory,
+}
+
+impl SaveLocationChoice {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Screenshots => Self::CurrentDirectory,
+            Self::CurrentDirectory => Self::Screenshots,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Screenshots => "screenshots",
+            Self::CurrentDirectory => "current_directory",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "screenshots" => Some(Self::Screenshots),
+            "current_directory" => Some(Self::CurrentDirectory),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GraphicalPreferences {
+    pub output: OutputDestination,
+    pub format: GraphicalFormat,
+    pub location: SaveLocationChoice,
+    pub mode: CaptureMode,
+}
+
+impl Default for GraphicalPreferences {
+    fn default() -> Self {
+        Self {
+            output: OutputDestination::Clipboard,
+            format: GraphicalFormat::Png,
+            location: SaveLocationChoice::Screenshots,
+            mode: CaptureMode::Area,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureMode {
     Area,
     Window,
@@ -15,7 +128,10 @@ pub enum CaptureMode {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionCommand {
     SetMode(CaptureMode),
-    CaptureArea(AreaSelection),
+    SetOutput(OutputDestination),
+    SetFormat(GraphicalFormat),
+    SetLocation(SaveLocationChoice),
+    CaptureArea(AreaSelection, GraphicalPreferences),
     Capture,
     Cancel,
 }
@@ -24,47 +140,67 @@ pub enum SessionCommand {
 pub enum SessionOutcome {
     Continue,
     Cancelled,
-    CaptureAreaToClipboard(AreaSelection),
+    CaptureArea(AreaSelection, GraphicalPreferences),
     Unsupported(String),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CaptureSession {
-    mode: CaptureMode,
-}
-
-impl Default for CaptureSession {
-    fn default() -> Self {
-        Self {
-            mode: CaptureMode::Area,
-        }
-    }
+    preferences: GraphicalPreferences,
 }
 
 impl CaptureSession {
-    pub fn mode(&self) -> CaptureMode {
-        self.mode
+    pub fn with_preferences(preferences: GraphicalPreferences) -> Self {
+        Self { preferences }
+    }
+
+    pub fn preferences(&self) -> GraphicalPreferences {
+        self.preferences
     }
 
     #[cfg(test)]
-    pub fn controls() -> [&'static str; 5] {
-        ["Area", "Window", "Full Screen", "Capture", "Cancel"]
+    pub fn controls() -> [&'static str; 8] {
+        [
+            "Area",
+            "Window",
+            "Full Screen",
+            "Output",
+            "Location",
+            "Format",
+            "Capture",
+            "Cancel",
+        ]
     }
 
     pub fn handle(&mut self, command: SessionCommand) -> SessionOutcome {
         match command {
             SessionCommand::SetMode(mode) => {
-                self.mode = mode;
+                self.preferences.mode = mode;
                 SessionOutcome::Continue
             }
-            SessionCommand::CaptureArea(selection) if self.mode == CaptureMode::Area => {
-                SessionOutcome::CaptureAreaToClipboard(selection)
+            SessionCommand::SetOutput(output) => {
+                self.preferences.output = output;
+                SessionOutcome::Continue
             }
-            SessionCommand::CaptureArea(_) => {
+            SessionCommand::SetFormat(format) => {
+                self.preferences.format = format;
+                SessionOutcome::Continue
+            }
+            SessionCommand::SetLocation(location) => {
+                self.preferences.location = location;
+                SessionOutcome::Continue
+            }
+            SessionCommand::CaptureArea(selection, preferences)
+                if self.preferences.mode == CaptureMode::Area =>
+            {
+                self.preferences = preferences;
+                SessionOutcome::CaptureArea(selection, preferences)
+            }
+            SessionCommand::CaptureArea(_, _) => {
                 SessionOutcome::Unsupported(self.unsupported_message())
             }
             SessionCommand::Cancel => SessionOutcome::Cancelled,
-            SessionCommand::Capture if self.mode == CaptureMode::Area => {
+            SessionCommand::Capture if self.preferences.mode == CaptureMode::Area => {
                 SessionOutcome::Unsupported("Draw an area before capturing.".to_string())
             }
             SessionCommand::Capture => SessionOutcome::Unsupported(self.unsupported_message()),
@@ -72,7 +208,7 @@ impl CaptureSession {
     }
 
     fn unsupported_message(&self) -> String {
-        match self.mode {
+        match self.preferences.mode {
             CaptureMode::Area => "Area capture from the graphical toolbar is not implemented yet. Use --select for direct area capture.",
             CaptureMode::Window => "Window capture from the graphical toolbar is not implemented yet.",
             CaptureMode::FullScreen => "Full screen capture from the graphical toolbar is not implemented yet. Use --instant for direct full-screen capture.",
@@ -89,7 +225,16 @@ mod tests {
     fn exposes_phase_one_toolbar_controls() {
         assert_eq!(
             CaptureSession::controls(),
-            ["Area", "Window", "Full Screen", "Capture", "Cancel"]
+            [
+                "Area",
+                "Window",
+                "Full Screen",
+                "Output",
+                "Location",
+                "Format",
+                "Capture",
+                "Cancel",
+            ]
         );
     }
 
@@ -101,7 +246,7 @@ mod tests {
             session.handle(SessionCommand::SetMode(CaptureMode::Window)),
             SessionOutcome::Continue
         );
-        assert_eq!(session.mode(), CaptureMode::Window);
+        assert_eq!(session.preferences().mode, CaptureMode::Window);
     }
 
     #[test]
@@ -112,10 +257,38 @@ mod tests {
             surface_size: (800, 600),
             output_name: Some("eDP-1".to_string()),
         };
+        let preferences = session.preferences();
 
         assert_eq!(
-            session.handle(SessionCommand::CaptureArea(selection.clone())),
-            SessionOutcome::CaptureAreaToClipboard(selection)
+            session.handle(SessionCommand::CaptureArea(selection.clone(), preferences)),
+            SessionOutcome::CaptureArea(selection, preferences)
+        );
+    }
+
+    #[test]
+    fn output_format_and_location_changes_continue_session() {
+        let mut session = CaptureSession::default();
+
+        assert_eq!(
+            session.handle(SessionCommand::SetOutput(OutputDestination::Save)),
+            SessionOutcome::Continue
+        );
+        assert_eq!(
+            session.handle(SessionCommand::SetFormat(GraphicalFormat::Jpg)),
+            SessionOutcome::Continue
+        );
+        assert_eq!(
+            session.handle(SessionCommand::SetLocation(
+                SaveLocationChoice::CurrentDirectory
+            )),
+            SessionOutcome::Continue
+        );
+
+        assert_eq!(session.preferences().output, OutputDestination::Save);
+        assert_eq!(session.preferences().format, GraphicalFormat::Jpg);
+        assert_eq!(
+            session.preferences().location,
+            SaveLocationChoice::CurrentDirectory
         );
     }
 

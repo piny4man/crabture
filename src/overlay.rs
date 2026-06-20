@@ -6,7 +6,10 @@
 //! border so the user can see the content underneath.
 //! Pointer click-drag selects the area; Escape or right-click cancels.
 
-use crate::session::{AreaSelection, CaptureMode, SessionCommand};
+use crate::session::{
+    AreaSelection, CaptureMode, GraphicalPreferences, OutputDestination, SaveLocationChoice,
+    SessionCommand,
+};
 use anyhow::{Context, Result};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
@@ -205,12 +208,16 @@ fn capture_area_command(
     rect: SelectionRect,
     surface_size: (u32, u32),
     output_name: Option<String>,
+    preferences: GraphicalPreferences,
 ) -> SessionCommand {
-    SessionCommand::CaptureArea(AreaSelection {
-        rect,
-        surface_size,
-        output_name,
-    })
+    SessionCommand::CaptureArea(
+        AreaSelection {
+            rect,
+            surface_size,
+            output_name,
+        },
+        preferences,
+    )
 }
 
 /// Run the fullscreen overlay and return `(selection, (surface_w, surface_h), output_name)`.
@@ -276,7 +283,8 @@ pub fn run_selection_overlay() -> Result<OverlayResult> {
         first_configure: true,
         exit: false,
         cancelled: false,
-        hud_mode: None,
+        hud_active: false,
+        preferences: GraphicalPreferences::default(),
         hud_result: None,
     };
 
@@ -299,7 +307,7 @@ pub fn run_selection_overlay() -> Result<OverlayResult> {
     Ok((state.selection, surf, output_name))
 }
 
-pub fn run_screenshot_hud(default_mode: CaptureMode) -> Result<SessionCommand> {
+pub fn run_screenshot_hud(default_preferences: GraphicalPreferences) -> Result<SessionCommand> {
     let conn = Connection::connect_to_env().context("failed to connect to Wayland")?;
     let (globals, mut event_queue) =
         registry_queue_init(&conn).context("failed to initialise Wayland registry")?;
@@ -351,7 +359,8 @@ pub fn run_screenshot_hud(default_mode: CaptureMode) -> Result<SessionCommand> {
         first_configure: true,
         exit: false,
         cancelled: false,
-        hud_mode: Some(default_mode),
+        hud_active: true,
+        preferences: default_preferences,
         hud_result: None,
     };
 
@@ -407,11 +416,25 @@ struct OverlayState {
     first_configure: bool,
     exit: bool,
     cancelled: bool,
-    hud_mode: Option<CaptureMode>,
+    hud_active: bool,
+    preferences: GraphicalPreferences,
     hud_result: Option<SessionCommand>,
 }
 
 impl OverlayState {
+    fn capture_or_error_command(&self) -> SessionCommand {
+        if let Some(rect) = self.selection {
+            capture_area_command(
+                rect,
+                (self.surface_w, self.surface_h),
+                self.output_name.clone(),
+                self.preferences,
+            )
+        } else {
+            SessionCommand::Capture
+        }
+    }
+
     fn draw(&mut self, qh: &QueueHandle<Self>) {
         let w = self.surface_w as usize;
         let h = self.surface_h as usize;
@@ -434,13 +457,10 @@ impl OverlayState {
         let pixels: &mut [u32] =
             unsafe { std::slice::from_raw_parts_mut(canvas.as_mut_ptr() as *mut u32, w * h) };
 
-        if let Some(mode) = self.hud_mode {
-            self.draw_hud(pixels, w, h, mode);
+        if self.hud_active {
+            self.draw_hud(pixels, w, h);
         } else {
-            // Fill entire surface with dark overlay.
             pixels.fill(OVERLAY_PIXEL);
-
-            // Draw selection rectangle at pointer coordinates.
             draw_selection(pixels, w, h, self.start, self.current, self.selection);
         }
 
@@ -465,15 +485,15 @@ impl OverlayState {
         self.layer.commit();
     }
 
-    fn draw_hud(&self, pixels: &mut [u32], w: usize, h: usize, mode: CaptureMode) {
-        if mode == CaptureMode::Area {
+    fn draw_hud(&self, pixels: &mut [u32], w: usize, h: usize) {
+        if self.preferences.mode == CaptureMode::Area {
             pixels.fill(OVERLAY_PIXEL);
             draw_selection(pixels, w, h, self.start, self.current, self.selection);
         } else {
             pixels.fill(CLEAR_PIXEL);
         }
-        for button in hud_buttons(w, h) {
-            let fill = if button.mode == Some(mode) {
+        for button in hud_buttons(w, h, self.preferences) {
+            let fill = if button.mode == Some(self.preferences.mode) {
                 HUD_ACTIVE_PIXEL
             } else {
                 HUD_PIXEL
@@ -492,7 +512,7 @@ impl OverlayState {
                 w,
                 button.x + 14,
                 button.y + 17,
-                button.label,
+                &button.label,
                 HUD_TEXT_PIXEL,
             );
         }
@@ -547,7 +567,7 @@ fn draw_selection(
 }
 
 struct HudButton {
-    label: &'static str,
+    label: String,
     x: usize,
     y: usize,
     width: usize,
@@ -556,60 +576,93 @@ struct HudButton {
     mode: Option<CaptureMode>,
 }
 
-fn hud_buttons(w: usize, h: usize) -> [HudButton; 5] {
-    let widths = [72, 96, 72, 112, 96];
+fn hud_buttons(w: usize, h: usize, preferences: GraphicalPreferences) -> Vec<HudButton> {
+    let widths = [72, 96, 72, 96, 118, 80, 112, 96];
     let gap = 8;
-    let total: usize = widths.iter().sum::<usize>() + gap * 4;
+    let total: usize = widths.iter().sum::<usize>() + gap * (widths.len() - 1);
     let x = w.saturating_sub(total) / 2;
     let y = h.saturating_sub(76);
+    let mut next_x = x;
+    let mut button =
+        |label: String, width: usize, command: SessionCommand, mode: Option<CaptureMode>| {
+            let current_x = next_x;
+            next_x += width + gap;
+            HudButton {
+                label,
+                x: current_x,
+                y,
+                width,
+                height: 44,
+                command,
+                mode,
+            }
+        };
 
-    [
-        HudButton {
-            label: "AREA",
-            x,
-            y,
-            width: widths[0],
-            height: 44,
-            command: SessionCommand::SetMode(CaptureMode::Area),
-            mode: Some(CaptureMode::Area),
-        },
-        HudButton {
-            label: "WINDOW",
-            x: x + widths[0] + gap,
-            y,
-            width: widths[1],
-            height: 44,
-            command: SessionCommand::SetMode(CaptureMode::Window),
-            mode: Some(CaptureMode::Window),
-        },
-        HudButton {
-            label: "FULL",
-            x: x + widths[0] + widths[1] + gap * 2,
-            y,
-            width: widths[2],
-            height: 44,
-            command: SessionCommand::SetMode(CaptureMode::FullScreen),
-            mode: Some(CaptureMode::FullScreen),
-        },
-        HudButton {
-            label: "CAPTURE",
-            x: x + widths[0] + widths[1] + widths[2] + gap * 3,
-            y,
-            width: widths[3],
-            height: 44,
-            command: SessionCommand::Capture,
-            mode: None,
-        },
-        HudButton {
-            label: "CANCEL",
-            x: x + widths[0] + widths[1] + widths[2] + widths[3] + gap * 4,
-            y,
-            width: widths[4],
-            height: 44,
-            command: SessionCommand::Cancel,
-            mode: None,
-        },
+    vec![
+        button(
+            "AREA".to_string(),
+            widths[0],
+            SessionCommand::SetMode(CaptureMode::Area),
+            Some(CaptureMode::Area),
+        ),
+        button(
+            "WINDOW".to_string(),
+            widths[1],
+            SessionCommand::SetMode(CaptureMode::Window),
+            Some(CaptureMode::Window),
+        ),
+        button(
+            "FULL".to_string(),
+            widths[2],
+            SessionCommand::SetMode(CaptureMode::FullScreen),
+            Some(CaptureMode::FullScreen),
+        ),
+        button(
+            output_label(preferences.output),
+            widths[3],
+            SessionCommand::SetOutput(preferences.output.next()),
+            None,
+        ),
+        button(
+            location_label(preferences.location),
+            widths[4],
+            SessionCommand::SetLocation(preferences.location.next()),
+            None,
+        ),
+        button(
+            preferences.format.as_str().to_ascii_uppercase(),
+            widths[5],
+            SessionCommand::SetFormat(preferences.format.next()),
+            None,
+        ),
+        button(
+            "CAPTURE".to_string(),
+            widths[6],
+            SessionCommand::Capture,
+            None,
+        ),
+        button(
+            "CANCEL".to_string(),
+            widths[7],
+            SessionCommand::Cancel,
+            None,
+        ),
     ]
+}
+
+fn output_label(output: OutputDestination) -> String {
+    match output {
+        OutputDestination::Clipboard => "COPY".to_string(),
+        OutputDestination::Save => "SAVE".to_string(),
+        OutputDestination::CopyAndSave => "COPY+SAVE".to_string(),
+    }
+}
+
+fn location_label(location: SaveLocationChoice) -> String {
+    match location {
+        SaveLocationChoice::Screenshots => "SCREENSHOTS".to_string(),
+        SaveLocationChoice::CurrentDirectory => "CURRENT DIR".to_string(),
+    }
 }
 
 fn fill_rect(
@@ -878,44 +931,48 @@ impl KeyboardHandler for OverlayState {
         _: u32,
         event: KeyEvent,
     ) {
-        if self.hud_mode.is_some() {
-            match event.keysym {
-                Keysym::Escape => {
-                    self.cancelled = true;
-                    self.exit = true;
-                }
-                Keysym::Return => {
-                    self.hud_result = Some(if let Some(rect) = self.selection {
-                        capture_area_command(
-                            rect,
-                            (self.surface_w, self.surface_h),
-                            self.output_name.clone(),
-                        )
-                    } else {
-                        SessionCommand::Capture
-                    });
-                    self.exit = true;
-                }
-                Keysym::a | Keysym::A => {
-                    self.hud_mode = Some(CaptureMode::Area);
-                    self.draw(qh);
-                }
-                Keysym::w | Keysym::W => {
-                    self.hud_mode = Some(CaptureMode::Window);
-                    self.draw(qh);
-                }
-                Keysym::f | Keysym::F => {
-                    self.hud_mode = Some(CaptureMode::FullScreen);
-                    self.draw(qh);
-                }
-                _ => {}
+        if !self.hud_active {
+            if event.keysym == Keysym::Escape {
+                self.cancelled = true;
+                self.exit = true;
             }
             return;
         }
 
-        if event.keysym == Keysym::Escape {
-            self.cancelled = true;
-            self.exit = true;
+        match event.keysym {
+            Keysym::Escape => {
+                self.cancelled = true;
+                self.exit = true;
+            }
+            Keysym::Return => {
+                self.hud_result = Some(self.capture_or_error_command());
+                self.exit = true;
+            }
+            Keysym::a | Keysym::A => {
+                self.preferences.mode = CaptureMode::Area;
+                self.draw(qh);
+            }
+            Keysym::w | Keysym::W => {
+                self.preferences.mode = CaptureMode::Window;
+                self.draw(qh);
+            }
+            Keysym::f | Keysym::F => {
+                self.preferences.mode = CaptureMode::FullScreen;
+                self.draw(qh);
+            }
+            Keysym::o | Keysym::O => {
+                self.preferences.output = self.preferences.output.next();
+                self.draw(qh);
+            }
+            Keysym::l | Keysym::L => {
+                self.preferences.location = self.preferences.location.next();
+                self.draw(qh);
+            }
+            Keysym::p | Keysym::P => {
+                self.preferences.format = self.preferences.format.next();
+                self.draw(qh);
+            }
+            _ => {}
         }
     }
 
@@ -978,13 +1035,16 @@ impl PointerHandler for OverlayState {
                     }
                 }
                 PointerEventKind::Press { button, .. } => {
-                    if let Some(mode) = self.hud_mode {
+                    if self.hud_active {
+                        let mode = self.preferences.mode;
                         if button == 0x110 {
                             let x = lx.round() as usize;
                             let y = ly.round() as usize;
-                            for hud_button in
-                                hud_buttons(self.surface_w as usize, self.surface_h as usize)
-                            {
+                            for hud_button in hud_buttons(
+                                self.surface_w as usize,
+                                self.surface_h as usize,
+                                self.preferences,
+                            ) {
                                 let inside_x =
                                     x >= hud_button.x && x < hud_button.x + hud_button.width;
                                 let inside_y =
@@ -992,27 +1052,30 @@ impl PointerHandler for OverlayState {
                                 if inside_x && inside_y {
                                     match hud_button.command {
                                         SessionCommand::SetMode(mode) => {
-                                            self.hud_mode = Some(mode);
+                                            self.preferences.mode = mode;
+                                            self.draw(qh);
+                                        }
+                                        SessionCommand::SetOutput(output) => {
+                                            self.preferences.output = output;
+                                            self.draw(qh);
+                                        }
+                                        SessionCommand::SetFormat(format) => {
+                                            self.preferences.format = format;
+                                            self.draw(qh);
+                                        }
+                                        SessionCommand::SetLocation(location) => {
+                                            self.preferences.location = location;
                                             self.draw(qh);
                                         }
                                         SessionCommand::Capture => {
-                                            self.hud_result =
-                                                Some(if let Some(rect) = self.selection {
-                                                    capture_area_command(
-                                                        rect,
-                                                        (self.surface_w, self.surface_h),
-                                                        self.output_name.clone(),
-                                                    )
-                                                } else {
-                                                    SessionCommand::Capture
-                                                });
+                                            self.hud_result = Some(self.capture_or_error_command());
                                             self.exit = true;
                                         }
                                         SessionCommand::Cancel => {
                                             self.cancelled = true;
                                             self.exit = true;
                                         }
-                                        SessionCommand::CaptureArea(_) => {}
+                                        SessionCommand::CaptureArea(_, _) => {}
                                     }
                                     return;
                                 }
@@ -1077,17 +1140,18 @@ impl PointerHandler for OverlayState {
                             self.selection = Some(rect);
                             self.start = None;
                             self.current = None;
-                            if self.hud_mode.is_none() {
+                            if !self.hud_active {
                                 self.hud_result = Some(capture_area_command(
                                     rect,
                                     (self.surface_w, self.surface_h),
                                     self.output_name.clone(),
+                                    self.preferences,
                                 ));
                             }
                         }
                         self.selecting = false;
                         self.area_drag = None;
-                        if self.hud_mode.is_none() {
+                        if !self.hud_active {
                             self.exit = true;
                         } else {
                             self.draw(qh);
@@ -1257,13 +1321,23 @@ mod tests {
 
     #[test]
     fn capture_command_uses_final_edited_rectangle() {
+        let preferences = GraphicalPreferences::default();
+
         assert_eq!(
-            capture_area_command((35, 20, 80, 50), (200, 120), Some("eDP-1".to_string())),
-            SessionCommand::CaptureArea(AreaSelection {
-                rect: (35, 20, 80, 50),
-                surface_size: (200, 120),
-                output_name: Some("eDP-1".to_string()),
-            })
+            capture_area_command(
+                (35, 20, 80, 50),
+                (200, 120),
+                Some("eDP-1".to_string()),
+                preferences,
+            ),
+            SessionCommand::CaptureArea(
+                AreaSelection {
+                    rect: (35, 20, 80, 50),
+                    surface_size: (200, 120),
+                    output_name: Some("eDP-1".to_string()),
+                },
+                preferences,
+            )
         );
     }
 }

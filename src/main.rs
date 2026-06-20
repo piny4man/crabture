@@ -17,7 +17,10 @@ use xcap::Monitor;
 mod overlay;
 mod session;
 
-use session::{AreaSelection, CaptureSession, SessionOutcome};
+use session::{
+    AreaSelection, CaptureSession, GraphicalFormat, GraphicalPreferences, OutputDestination,
+    SaveLocationChoice, SessionOutcome,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -82,7 +85,7 @@ enum CaptureKind {
     Selection,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SaveHow {
     Copy,
     Save,
@@ -95,11 +98,6 @@ struct PhysicalCrop {
     y: u32,
     w: u32,
     h: u32,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum GraphicalOutput {
-    Clipboard,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -222,33 +220,114 @@ fn cli_intent(cli: &Cli) -> CliIntent {
 }
 
 fn run_graphical_screenshot_ui() -> Result<()> {
-    let mut session = CaptureSession::default();
+    let preferences = load_graphical_preferences().unwrap_or_default();
+    let mut session = CaptureSession::with_preferences(preferences);
     let all_screenshots = capture_all_outputs()?;
-    let command = overlay::run_screenshot_hud(session.mode()).context("graphical UI failed")?;
+    let command =
+        overlay::run_screenshot_hud(session.preferences()).context("graphical UI failed")?;
 
     match session.handle(command) {
         SessionOutcome::Continue => Ok(()),
         SessionOutcome::Cancelled => Ok(()),
-        SessionOutcome::CaptureAreaToClipboard(selection) => {
+        SessionOutcome::CaptureArea(selection, preferences) => {
+            save_graphical_preferences(&preferences).ok();
             let img = selected_area_image(&all_screenshots, &selection)?;
-            save_graphical_capture(&img, default_graphical_output())
+            save_graphical_capture(&img, preferences)
         }
         SessionOutcome::Unsupported(message) => bail!(message),
     }
 }
 
-fn save_graphical_capture(img: &image::RgbaImage, output: GraphicalOutput) -> Result<()> {
-    match output {
-        GraphicalOutput::Clipboard => {
-            copy_to_clipboard(img)?;
-            notify("Screenshot copied", "Image copied to clipboard");
-        }
-    }
-    Ok(())
+fn save_graphical_capture(img: &image::RgbaImage, preferences: GraphicalPreferences) -> Result<()> {
+    let shot_dir = graphical_save_dir(preferences.location);
+    fs::create_dir_all(&shot_dir).ok();
+    let (how, format) = graphical_save_plan(preferences);
+    save_screenshot(img, how, &shot_dir, format)
 }
 
-fn default_graphical_output() -> GraphicalOutput {
-    GraphicalOutput::Clipboard
+fn graphical_save_plan(preferences: GraphicalPreferences) -> (SaveHow, &'static str) {
+    (
+        graphical_save_how(preferences.output),
+        preferences.format.as_str(),
+    )
+}
+
+fn graphical_save_how(output: OutputDestination) -> SaveHow {
+    match output {
+        OutputDestination::Clipboard => SaveHow::Copy,
+        OutputDestination::Save => SaveHow::Save,
+        OutputDestination::CopyAndSave => SaveHow::CopyAndSave,
+    }
+}
+
+fn graphical_save_dir(location: SaveLocationChoice) -> PathBuf {
+    match location {
+        SaveLocationChoice::Screenshots => {
+            xdg_screenshots_dir().unwrap_or_else(|| home().join("Pictures"))
+        }
+        SaveLocationChoice::CurrentDirectory => {
+            env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        }
+    }
+}
+
+fn preferences_path() -> PathBuf {
+    env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".config"))
+        .join("crabture")
+        .join("preferences")
+}
+
+fn load_graphical_preferences() -> Option<GraphicalPreferences> {
+    parse_graphical_preferences(&fs::read_to_string(preferences_path()).ok()?)
+}
+
+fn save_graphical_preferences(preferences: &GraphicalPreferences) -> Result<()> {
+    let path = preferences_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).context("failed to create preferences directory")?;
+    }
+    fs::write(path, serialize_graphical_preferences(preferences))
+        .context("failed to write preferences")
+}
+
+fn serialize_graphical_preferences(preferences: &GraphicalPreferences) -> String {
+    format!(
+        "output={}\nformat={}\nlocation={}\nmode={}\n",
+        preferences.output.as_str(),
+        preferences.format.as_str(),
+        preferences.location.as_str(),
+        match preferences.mode {
+            session::CaptureMode::Area => "area",
+            session::CaptureMode::Window => "window",
+            session::CaptureMode::FullScreen => "full_screen",
+        }
+    )
+}
+
+fn parse_graphical_preferences(contents: &str) -> Option<GraphicalPreferences> {
+    let mut preferences = GraphicalPreferences::default();
+
+    for line in contents.lines() {
+        let (key, value) = line.split_once('=')?;
+        match key.trim() {
+            "output" => preferences.output = OutputDestination::from_str(value.trim())?,
+            "format" => preferences.format = GraphicalFormat::from_str(value.trim())?,
+            "location" => preferences.location = SaveLocationChoice::from_str(value.trim())?,
+            "mode" => {
+                preferences.mode = match value.trim() {
+                    "area" => session::CaptureMode::Area,
+                    "window" => session::CaptureMode::Window,
+                    "full_screen" => session::CaptureMode::FullScreen,
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        }
+    }
+
+    Some(preferences)
 }
 
 fn run_interactive(shot_dir: &Path, format: &str) -> Result<()> {
@@ -774,7 +853,63 @@ mod tests {
 
     #[test]
     fn graphical_area_capture_defaults_to_clipboard_output() {
-        assert_eq!(default_graphical_output(), GraphicalOutput::Clipboard);
+        assert_eq!(
+            GraphicalPreferences::default().output,
+            OutputDestination::Clipboard
+        );
+        assert_eq!(GraphicalPreferences::default().format, GraphicalFormat::Png);
+        assert_eq!(
+            GraphicalPreferences::default().location,
+            SaveLocationChoice::Screenshots
+        );
+    }
+
+    #[test]
+    fn graphical_output_preferences_map_every_output_and_format_to_save_pipeline() {
+        let cases = [
+            (OutputDestination::Clipboard, SaveHow::Copy),
+            (OutputDestination::Save, SaveHow::Save),
+            (OutputDestination::CopyAndSave, SaveHow::CopyAndSave),
+        ];
+
+        for (output, how) in cases {
+            for format in [GraphicalFormat::Png, GraphicalFormat::Jpg] {
+                let preferences = GraphicalPreferences {
+                    output,
+                    format,
+                    location: SaveLocationChoice::Screenshots,
+                    mode: crate::session::CaptureMode::Area,
+                };
+
+                assert_eq!(graphical_save_plan(preferences), (how, format.as_str()));
+            }
+        }
+    }
+
+    #[test]
+    fn graphical_preferences_round_trip_to_disk_format() {
+        let preferences = GraphicalPreferences {
+            output: OutputDestination::CopyAndSave,
+            format: GraphicalFormat::Jpg,
+            location: SaveLocationChoice::CurrentDirectory,
+            mode: crate::session::CaptureMode::Window,
+        };
+
+        assert_eq!(
+            parse_graphical_preferences(&serialize_graphical_preferences(&preferences)),
+            Some(preferences)
+        );
+    }
+
+    #[test]
+    fn corrupt_or_stale_graphical_preferences_do_not_parse() {
+        assert_eq!(parse_graphical_preferences("not preferences"), None);
+        assert_eq!(
+            parse_graphical_preferences(
+                "output=stale\nformat=png\nlocation=screenshots\nmode=area\n"
+            ),
+            None
+        );
     }
 
     #[test]
@@ -834,11 +969,14 @@ mod tests {
 
         assert_ne!(
             session.handle(SessionCommand::Cancel),
-            SessionOutcome::CaptureAreaToClipboard(AreaSelection {
-                rect: (1, 1, 2, 2),
-                surface_size: (10, 10),
-                output_name: None,
-            })
+            SessionOutcome::CaptureArea(
+                AreaSelection {
+                    rect: (1, 1, 2, 2),
+                    surface_size: (10, 10),
+                    output_name: None,
+                },
+                GraphicalPreferences::default()
+            )
         );
     }
 }
