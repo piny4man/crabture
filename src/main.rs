@@ -33,7 +33,7 @@ struct Cli {
     #[arg(long)]
     monitor: Option<usize>,
 
-    /// Interactive area selection with cursor
+    /// Fast immediate area capture with cursor
     #[arg(long)]
     select: bool,
 
@@ -718,6 +718,7 @@ fn xdg_screenshots_dir() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::session::SessionCommand;
+    use clap::CommandFactory;
 
     #[test]
     fn no_arguments_launch_graphical_default() {
@@ -736,6 +737,13 @@ mod tests {
 
         let cli = Cli::try_parse_from(["crabture", "--region", "1,2,3x4"]).expect("valid cli");
         assert_eq!(cli_intent(&cli), CliIntent::DirectCapture);
+    }
+
+    #[test]
+    fn select_help_documents_fast_immediate_capture_path() {
+        let help = Cli::command().render_long_help().to_string();
+
+        assert!(help.contains("Fast immediate area capture with cursor"));
     }
 
     #[test]

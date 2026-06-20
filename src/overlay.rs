@@ -67,6 +67,152 @@ pub fn selection_rect_from_drag(start: (f64, f64), current: (f64, f64)) -> Selec
     (x1, y1, x2.saturating_sub(x1), y2.saturating_sub(y1))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResizeHandle {
+    North,
+    South,
+    East,
+    West,
+    NorthEast,
+    NorthWest,
+    SouthEast,
+    SouthWest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AreaDrag {
+    Drawing,
+    Moving {
+        original: SelectionRect,
+        pointer_start: (i32, i32),
+    },
+    Resizing {
+        original: SelectionRect,
+        handle: ResizeHandle,
+    },
+}
+
+const MIN_SELECTION_SIZE: u32 = 8;
+const HANDLE_HIT_SIZE: i32 = 10;
+
+fn clamp_selection_rect(rect: SelectionRect, surface_size: (u32, u32)) -> SelectionRect {
+    let (surface_w, surface_h) = surface_size;
+    let w = rect.2.max(MIN_SELECTION_SIZE).min(surface_w.max(1));
+    let h = rect.3.max(MIN_SELECTION_SIZE).min(surface_h.max(1));
+    let x = rect.0.min(surface_w.saturating_sub(w));
+    let y = rect.1.min(surface_h.saturating_sub(h));
+
+    (x, y, w, h)
+}
+
+fn move_selection_rect(
+    rect: SelectionRect,
+    delta: (i32, i32),
+    surface_size: (u32, u32),
+) -> SelectionRect {
+    let x = (rect.0 as i32 + delta.0).clamp(0, surface_size.0.saturating_sub(rect.2) as i32) as u32;
+    let y = (rect.1 as i32 + delta.1).clamp(0, surface_size.1.saturating_sub(rect.3) as i32) as u32;
+
+    (x, y, rect.2, rect.3)
+}
+
+fn resize_selection_rect(
+    rect: SelectionRect,
+    handle: ResizeHandle,
+    pointer: (i32, i32),
+    surface_size: (u32, u32),
+) -> SelectionRect {
+    let left = rect.0 as i32;
+    let top = rect.1 as i32;
+    let right = rect.0 as i32 + rect.2 as i32;
+    let bottom = rect.1 as i32 + rect.3 as i32;
+    let min = MIN_SELECTION_SIZE as i32;
+
+    let mut new_left = left;
+    let mut new_top = top;
+    let mut new_right = right;
+    let mut new_bottom = bottom;
+
+    match handle {
+        ResizeHandle::North => new_top = pointer.1.clamp(0, bottom - min),
+        ResizeHandle::South => new_bottom = pointer.1.clamp(top + min, surface_size.1 as i32),
+        ResizeHandle::East => new_right = pointer.0.clamp(left + min, surface_size.0 as i32),
+        ResizeHandle::West => new_left = pointer.0.clamp(0, right - min),
+        ResizeHandle::NorthEast => {
+            new_top = pointer.1.clamp(0, bottom - min);
+            new_right = pointer.0.clamp(left + min, surface_size.0 as i32);
+        }
+        ResizeHandle::NorthWest => {
+            new_top = pointer.1.clamp(0, bottom - min);
+            new_left = pointer.0.clamp(0, right - min);
+        }
+        ResizeHandle::SouthEast => {
+            new_bottom = pointer.1.clamp(top + min, surface_size.1 as i32);
+            new_right = pointer.0.clamp(left + min, surface_size.0 as i32);
+        }
+        ResizeHandle::SouthWest => {
+            new_bottom = pointer.1.clamp(top + min, surface_size.1 as i32);
+            new_left = pointer.0.clamp(0, right - min);
+        }
+    }
+
+    clamp_selection_rect(
+        (
+            new_left as u32,
+            new_top as u32,
+            (new_right - new_left) as u32,
+            (new_bottom - new_top) as u32,
+        ),
+        surface_size,
+    )
+}
+
+fn hit_resize_handle(rect: SelectionRect, point: (i32, i32)) -> Option<ResizeHandle> {
+    let left = rect.0 as i32;
+    let top = rect.1 as i32;
+    let right = rect.0 as i32 + rect.2 as i32;
+    let bottom = rect.1 as i32 + rect.3 as i32;
+    let near = |value: i32, target: i32| (value - target).abs() <= HANDLE_HIT_SIZE;
+    let inside_x = point.0 >= left - HANDLE_HIT_SIZE && point.0 <= right + HANDLE_HIT_SIZE;
+    let inside_y = point.1 >= top - HANDLE_HIT_SIZE && point.1 <= bottom + HANDLE_HIT_SIZE;
+
+    match (
+        near(point.0, left),
+        near(point.0, right),
+        near(point.1, top),
+        near(point.1, bottom),
+    ) {
+        (true, _, true, _) => Some(ResizeHandle::NorthWest),
+        (_, true, true, _) => Some(ResizeHandle::NorthEast),
+        (true, _, _, true) => Some(ResizeHandle::SouthWest),
+        (_, true, _, true) => Some(ResizeHandle::SouthEast),
+        (_, _, true, _) if inside_x => Some(ResizeHandle::North),
+        (_, _, _, true) if inside_x => Some(ResizeHandle::South),
+        (true, _, _, _) if inside_y => Some(ResizeHandle::West),
+        (_, true, _, _) if inside_y => Some(ResizeHandle::East),
+        _ => None,
+    }
+}
+
+fn point_in_rect(rect: SelectionRect, point: (i32, i32)) -> bool {
+    point.0 >= rect.0 as i32
+        && point.0 <= (rect.0 + rect.2) as i32
+        && point.1 >= rect.1 as i32
+        && point.1 <= (rect.1 + rect.3) as i32
+}
+
+fn capture_area_command(
+    rect: SelectionRect,
+    surface_size: (u32, u32),
+    output_name: Option<String>,
+) -> SessionCommand {
+    SessionCommand::CaptureArea(AreaSelection {
+        rect,
+        surface_size,
+        output_name,
+    })
+}
+
 /// Run the fullscreen overlay and return `(selection, (surface_w, surface_h), output_name)`.
 /// `selection` is `Some((x, y, w, h))` in logical surface coordinates, or
 /// `None` if cancelled.  `output_name` identifies which monitor the overlay
@@ -120,6 +266,7 @@ pub fn run_selection_overlay() -> Result<OverlayResult> {
         start: None,
         current: None,
         selection: None,
+        area_drag: None,
 
         output_name: None,
 
@@ -194,6 +341,7 @@ pub fn run_screenshot_hud(default_mode: CaptureMode) -> Result<SessionCommand> {
         start: None,
         current: None,
         selection: None,
+        area_drag: None,
 
         output_name: None,
 
@@ -246,6 +394,7 @@ struct OverlayState {
     start: Option<(f64, f64)>,
     current: Option<(f64, f64)>,
     selection: Option<(u32, u32, u32, u32)>,
+    area_drag: Option<AreaDrag>,
 
     /// Name of the output the overlay surface is on (e.g. "eDP-1", "HDMI-A-1").
     output_name: Option<String>,
@@ -292,7 +441,7 @@ impl OverlayState {
             pixels.fill(OVERLAY_PIXEL);
 
             // Draw selection rectangle at pointer coordinates.
-            draw_selection(pixels, w, h, self.start, self.current);
+            draw_selection(pixels, w, h, self.start, self.current, self.selection);
         }
 
         self.layer.wl_surface().set_buffer_scale(1);
@@ -319,7 +468,7 @@ impl OverlayState {
     fn draw_hud(&self, pixels: &mut [u32], w: usize, h: usize, mode: CaptureMode) {
         if mode == CaptureMode::Area {
             pixels.fill(OVERLAY_PIXEL);
-            draw_selection(pixels, w, h, self.start, self.current);
+            draw_selection(pixels, w, h, self.start, self.current, self.selection);
         } else {
             pixels.fill(CLEAR_PIXEL);
         }
@@ -356,12 +505,19 @@ fn draw_selection(
     h: usize,
     start: Option<(f64, f64)>,
     current: Option<(f64, f64)>,
+    selection: Option<SelectionRect>,
 ) {
-    if let (Some(start), Some(cur)) = (start, current) {
-        let x1 = (start.0.min(cur.0).round() as usize).min(w.saturating_sub(1));
-        let y1 = (start.1.min(cur.1).round() as usize).min(h.saturating_sub(1));
-        let x2 = (start.0.max(cur.0).round() as usize).min(w);
-        let y2 = (start.1.max(cur.1).round() as usize).min(h);
+    let rect = if let (Some(start), Some(cur)) = (start, current) {
+        Some(selection_rect_from_drag(start, cur))
+    } else {
+        selection
+    };
+
+    if let Some((x, y, width, height)) = rect {
+        let x1 = (x as usize).min(w.saturating_sub(1));
+        let y1 = (y as usize).min(h.saturating_sub(1));
+        let x2 = (x as usize + width as usize).min(w);
+        let y2 = (y as usize + height as usize).min(h);
 
         if x2 > x1 && y2 > y1 {
             for row in y1..y2 {
@@ -729,7 +885,15 @@ impl KeyboardHandler for OverlayState {
                     self.exit = true;
                 }
                 Keysym::Return => {
-                    self.hud_result = Some(SessionCommand::Capture);
+                    self.hud_result = Some(if let Some(rect) = self.selection {
+                        capture_area_command(
+                            rect,
+                            (self.surface_w, self.surface_h),
+                            self.output_name.clone(),
+                        )
+                    } else {
+                        SessionCommand::Capture
+                    });
                     self.exit = true;
                 }
                 Keysym::a | Keysym::A => {
@@ -832,7 +996,16 @@ impl PointerHandler for OverlayState {
                                             self.draw(qh);
                                         }
                                         SessionCommand::Capture => {
-                                            self.hud_result = Some(SessionCommand::Capture);
+                                            self.hud_result =
+                                                Some(if let Some(rect) = self.selection {
+                                                    capture_area_command(
+                                                        rect,
+                                                        (self.surface_w, self.surface_h),
+                                                        self.output_name.clone(),
+                                                    )
+                                                } else {
+                                                    SessionCommand::Capture
+                                                });
                                             self.exit = true;
                                         }
                                         SessionCommand::Cancel => {
@@ -845,8 +1018,29 @@ impl PointerHandler for OverlayState {
                                 }
                             }
                             if mode == CaptureMode::Area {
-                                self.start = Some((lx, ly));
-                                self.current = Some((lx, ly));
+                                let point = (lx.round() as i32, ly.round() as i32);
+                                self.area_drag = if let Some(rect) = self.selection {
+                                    if let Some(handle) = hit_resize_handle(rect, point) {
+                                        Some(AreaDrag::Resizing {
+                                            original: rect,
+                                            handle,
+                                        })
+                                    } else if point_in_rect(rect, point) {
+                                        Some(AreaDrag::Moving {
+                                            original: rect,
+                                            pointer_start: point,
+                                        })
+                                    } else {
+                                        self.selection = None;
+                                        self.start = Some((lx, ly));
+                                        self.current = Some((lx, ly));
+                                        Some(AreaDrag::Drawing)
+                                    }
+                                } else {
+                                    self.start = Some((lx, ly));
+                                    self.current = Some((lx, ly));
+                                    Some(AreaDrag::Drawing)
+                                };
                                 self.selecting = true;
                                 self.draw(qh);
                             }
@@ -861,6 +1055,7 @@ impl PointerHandler for OverlayState {
                     if button == 0x110 {
                         self.start = Some((lx, ly));
                         self.current = Some((lx, ly));
+                        self.area_drag = Some(AreaDrag::Drawing);
                         self.selecting = true;
                         needs_redraw = true;
                     }
@@ -872,25 +1067,60 @@ impl PointerHandler for OverlayState {
                 }
                 PointerEventKind::Release { button, .. } => {
                     if button == 0x110 && self.selecting {
-                        if let (Some((sx, sy)), Some((cx, cy))) = (self.start, self.current) {
-                            let rect = selection_rect_from_drag((sx, sy), (cx, cy));
+                        if matches!(self.area_drag, Some(AreaDrag::Drawing))
+                            && let (Some((sx, sy)), Some((cx, cy))) = (self.start, self.current)
+                        {
+                            let rect = clamp_selection_rect(
+                                selection_rect_from_drag((sx, sy), (cx, cy)),
+                                (self.surface_w, self.surface_h),
+                            );
                             self.selection = Some(rect);
-                            if self.hud_mode == Some(CaptureMode::Area) {
-                                self.hud_result =
-                                    Some(SessionCommand::CaptureArea(AreaSelection {
-                                        rect,
-                                        surface_size: (self.surface_w, self.surface_h),
-                                        output_name: self.output_name.clone(),
-                                    }));
+                            self.start = None;
+                            self.current = None;
+                            if self.hud_mode.is_none() {
+                                self.hud_result = Some(capture_area_command(
+                                    rect,
+                                    (self.surface_w, self.surface_h),
+                                    self.output_name.clone(),
+                                ));
                             }
                         }
                         self.selecting = false;
-                        self.exit = true;
+                        self.area_drag = None;
+                        if self.hud_mode.is_none() {
+                            self.exit = true;
+                        } else {
+                            self.draw(qh);
+                        }
                         return;
                     }
                 }
                 PointerEventKind::Motion { .. } if self.selecting => {
-                    self.current = Some((lx, ly));
+                    match self.area_drag {
+                        Some(AreaDrag::Drawing) => self.current = Some((lx, ly)),
+                        Some(AreaDrag::Moving {
+                            original,
+                            pointer_start,
+                        }) => {
+                            self.selection = Some(move_selection_rect(
+                                original,
+                                (
+                                    lx.round() as i32 - pointer_start.0,
+                                    ly.round() as i32 - pointer_start.1,
+                                ),
+                                (self.surface_w, self.surface_h),
+                            ));
+                        }
+                        Some(AreaDrag::Resizing { original, handle }) => {
+                            self.selection = Some(resize_selection_rect(
+                                original,
+                                handle,
+                                (lx.round() as i32, ly.round() as i32),
+                                (self.surface_w, self.surface_h),
+                            ));
+                        }
+                        None => {}
+                    }
                     needs_redraw = true;
                 }
                 _ => {}
@@ -954,6 +1184,86 @@ mod tests {
         assert_eq!(
             selection_rect_from_drag((10.4, 20.5), (25.6, 30.4)),
             (10, 21, 16, 9)
+        );
+    }
+
+    #[test]
+    fn moves_selection_within_surface_bounds() {
+        assert_eq!(
+            move_selection_rect((20, 30, 80, 50), (15, -10), (200, 120)),
+            (35, 20, 80, 50)
+        );
+        assert_eq!(
+            move_selection_rect((20, 30, 80, 50), (-50, 100), (200, 120)),
+            (0, 70, 80, 50)
+        );
+    }
+
+    #[test]
+    fn resizes_selection_from_edges_and_corners() {
+        assert_eq!(
+            resize_selection_rect(
+                (20, 30, 80, 50),
+                ResizeHandle::SouthEast,
+                (140, 100),
+                (200, 120)
+            ),
+            (20, 30, 120, 70)
+        );
+        assert_eq!(
+            resize_selection_rect((20, 30, 80, 50), ResizeHandle::West, (10, 99), (200, 120)),
+            (10, 30, 90, 50)
+        );
+    }
+
+    #[test]
+    fn resize_enforces_minimum_size_and_surface_bounds() {
+        assert_eq!(
+            resize_selection_rect(
+                (20, 30, 80, 50),
+                ResizeHandle::NorthWest,
+                (99, 79),
+                (200, 120)
+            ),
+            (92, 72, 8, 8)
+        );
+        assert_eq!(
+            resize_selection_rect(
+                (20, 30, 80, 50),
+                ResizeHandle::SouthEast,
+                (300, 200),
+                (120, 90)
+            ),
+            (20, 30, 100, 60)
+        );
+    }
+
+    #[test]
+    fn hit_testing_prioritizes_handles_over_move_region() {
+        let rect = (20, 30, 80, 50);
+
+        assert_eq!(
+            hit_resize_handle(rect, (20, 30)),
+            Some(ResizeHandle::NorthWest)
+        );
+        assert_eq!(
+            hit_resize_handle(rect, (100, 80)),
+            Some(ResizeHandle::SouthEast)
+        );
+        assert_eq!(hit_resize_handle(rect, (60, 30)), Some(ResizeHandle::North));
+        assert_eq!(hit_resize_handle(rect, (60, 55)), None);
+        assert!(point_in_rect(rect, (60, 55)));
+    }
+
+    #[test]
+    fn capture_command_uses_final_edited_rectangle() {
+        assert_eq!(
+            capture_area_command((35, 20, 80, 50), (200, 120), Some("eDP-1".to_string())),
+            SessionCommand::CaptureArea(AreaSelection {
+                rect: (35, 20, 80, 50),
+                surface_size: (200, 120),
+                output_name: Some("eDP-1".to_string()),
+            })
         );
     }
 }
