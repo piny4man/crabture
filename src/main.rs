@@ -89,6 +89,31 @@ enum SaveHow {
     CopyAndSave,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PhysicalCrop {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GraphicalOutput {
+    Clipboard,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ClipboardDaemonCommand {
+    exe: PathBuf,
+    image_path: PathBuf,
+}
+
+impl ClipboardDaemonCommand {
+    fn args(&self) -> [&Path; 2] {
+        [Path::new("--__clipboard-daemon"), self.image_path.as_path()]
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let intent = cli_intent(&cli);
@@ -203,8 +228,26 @@ fn run_graphical_screenshot_ui() -> Result<()> {
     match session.handle(command) {
         SessionOutcome::Continue => Ok(()),
         SessionOutcome::Cancelled => Ok(()),
+        SessionOutcome::CaptureAreaToClipboard => {
+            let img = select_area()?;
+            save_graphical_capture(&img, default_graphical_output())
+        }
         SessionOutcome::Unsupported(message) => bail!(message),
     }
+}
+
+fn save_graphical_capture(img: &image::RgbaImage, output: GraphicalOutput) -> Result<()> {
+    match output {
+        GraphicalOutput::Clipboard => {
+            copy_to_clipboard(img)?;
+            notify("Screenshot copied", "Image copied to clipboard");
+        }
+    }
+    Ok(())
+}
+
+fn default_graphical_output() -> GraphicalOutput {
+    GraphicalOutput::Clipboard
 }
 
 fn run_interactive(shot_dir: &Path, format: &str) -> Result<()> {
@@ -377,50 +420,69 @@ fn select_area() -> Result<image::RgbaImage> {
                 &all_screenshots[0].1
             };
 
-            let img_w = screenshot.width();
-            let img_h = screenshot.height();
+            let crop = map_selection_to_physical_crop(
+                (sx, sy, sw, sh),
+                surf_size,
+                (screenshot.width(), screenshot.height()),
+            );
 
-            // Pointer coords are in logical surface space (0..surface_w).
-            // The image is at physical resolution (img_w × img_h).
-            // Map: image_coord = logical_coord * img_w / surface_w.
-            // This handles per-monitor resolution and fractional scaling
-            // automatically because both dimensions refer to the same output.
-            let (surf_w, surf_h) = surf_size;
-            let surf_w = if surf_w > 0 { surf_w } else { img_w };
-            let surf_h = if surf_h > 0 { surf_h } else { img_h };
-            let scale_x = f64::from(img_w) / f64::from(surf_w);
-            let scale_y = f64::from(img_h) / f64::from(surf_h);
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "coordinates are non-negative and bounded by surface dimensions"
-            )]
-            let x = (f64::from(sx) * scale_x).round() as u32;
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "coordinates are non-negative and bounded by surface dimensions"
-            )]
-            let y = (f64::from(sy) * scale_y).round() as u32;
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "coordinates are non-negative and bounded by surface dimensions"
-            )]
-            let w = (f64::from(sw) * scale_x).round() as u32;
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "coordinates are non-negative and bounded by surface dimensions"
-            )]
-            let h = (f64::from(sh) * scale_y).round() as u32;
-
-            // Clamp to image bounds.
-            let x = x.min(img_w.saturating_sub(1));
-            let y = y.min(img_h.saturating_sub(1));
-            let w = w.min(img_w - x);
-            let h = h.min(img_h - y);
-
-            let cropped = image::imageops::crop_imm(screenshot, x, y, w, h).to_image();
+            let cropped =
+                image::imageops::crop_imm(screenshot, crop.x, crop.y, crop.w, crop.h).to_image();
             Ok(cropped)
         }
         None => bail!("selection cancelled"),
+    }
+}
+
+fn map_selection_to_physical_crop(
+    selection: overlay::SelectionRect,
+    surface_size: (u32, u32),
+    image_size: (u32, u32),
+) -> PhysicalCrop {
+    let (sx, sy, sw, sh) = selection;
+    let (img_w, img_h) = image_size;
+    let surf_w = if surface_size.0 > 0 {
+        surface_size.0
+    } else {
+        img_w
+    };
+    let surf_h = if surface_size.1 > 0 {
+        surface_size.1
+    } else {
+        img_h
+    };
+
+    let scale_x = f64::from(img_w) / f64::from(surf_w);
+    let scale_y = f64::from(img_h) / f64::from(surf_h);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "coordinates are non-negative and bounded by surface dimensions"
+    )]
+    let x = (f64::from(sx) * scale_x).round() as u32;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "coordinates are non-negative and bounded by surface dimensions"
+    )]
+    let y = (f64::from(sy) * scale_y).round() as u32;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "coordinates are non-negative and bounded by surface dimensions"
+    )]
+    let w = (f64::from(sw) * scale_x).round() as u32;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "coordinates are non-negative and bounded by surface dimensions"
+    )]
+    let h = (f64::from(sh) * scale_y).round() as u32;
+
+    let x = x.min(img_w.saturating_sub(1));
+    let y = y.min(img_h.saturating_sub(1));
+
+    PhysicalCrop {
+        x,
+        y,
+        w: w.min(img_w - x),
+        h: h.min(img_h - y),
     }
 }
 
@@ -515,9 +577,13 @@ fn copy_to_clipboard(img: &image::RgbaImage) -> Result<()> {
     img.save(&tmp)
         .context("failed to write clipboard temp file")?;
 
-    process::Command::new(env::current_exe().context("could not find own executable")?)
-        .arg("--__clipboard-daemon")
-        .arg(&tmp)
+    let command = clipboard_daemon_command(
+        env::current_exe().context("could not find own executable")?,
+        tmp,
+    );
+
+    process::Command::new(&command.exe)
+        .args(command.args())
         .stdin(process::Stdio::null())
         .stdout(process::Stdio::null())
         .stderr(process::Stdio::null())
@@ -525,6 +591,10 @@ fn copy_to_clipboard(img: &image::RgbaImage) -> Result<()> {
         .context("failed to spawn clipboard daemon")?;
 
     Ok(())
+}
+
+fn clipboard_daemon_command(exe: PathBuf, image_path: PathBuf) -> ClipboardDaemonCommand {
+    ClipboardDaemonCommand { exe, image_path }
 }
 
 /// Runs in the background child process: reads the image from `path`, places it
@@ -669,13 +739,82 @@ mod tests {
     #[test]
     fn unimplemented_capture_reports_helpful_feedback() {
         let mut session = CaptureSession::default();
+        session.handle(SessionCommand::SetMode(
+            crate::session::CaptureMode::FullScreen,
+        ));
 
         assert_eq!(
             session.handle(SessionCommand::Capture),
             SessionOutcome::Unsupported(
-                "Area capture from the graphical toolbar is not implemented yet. Use --select for direct area capture."
+                "Full screen capture from the graphical toolbar is not implemented yet. Use --instant for direct full-screen capture."
                     .to_string()
             )
+        );
+    }
+
+    #[test]
+    fn graphical_area_capture_defaults_to_clipboard_output() {
+        assert_eq!(default_graphical_output(), GraphicalOutput::Clipboard);
+    }
+
+    #[test]
+    fn clipboard_output_uses_background_daemon_for_persistence() {
+        let command = clipboard_daemon_command(
+            PathBuf::from("/usr/bin/crabture"),
+            PathBuf::from("/tmp/crabture_clip_123.png"),
+        );
+
+        assert_eq!(command.exe, PathBuf::from("/usr/bin/crabture"));
+        assert_eq!(
+            command.image_path,
+            PathBuf::from("/tmp/crabture_clip_123.png")
+        );
+        assert_eq!(
+            command.args(),
+            [
+                Path::new("--__clipboard-daemon"),
+                Path::new("/tmp/crabture_clip_123.png")
+            ]
+        );
+    }
+
+    #[test]
+    fn maps_logical_selection_to_fractional_scaled_physical_crop() {
+        let crop = map_selection_to_physical_crop((10, 20, 100, 50), (800, 450), (1200, 675));
+
+        assert_eq!(
+            crop,
+            PhysicalCrop {
+                x: 15,
+                y: 30,
+                w: 150,
+                h: 75,
+            }
+        );
+    }
+
+    #[test]
+    fn maps_selection_to_physical_crop_with_bounds_clamping() {
+        let crop = map_selection_to_physical_crop((790, 440, 30, 30), (800, 450), (1200, 675));
+
+        assert_eq!(
+            crop,
+            PhysicalCrop {
+                x: 1185,
+                y: 660,
+                w: 15,
+                h: 15,
+            }
+        );
+    }
+
+    #[test]
+    fn cancellation_keeps_session_from_requesting_output() {
+        let mut session = CaptureSession::default();
+
+        assert_ne!(
+            session.handle(SessionCommand::Cancel),
+            SessionOutcome::CaptureAreaToClipboard
         );
     }
 }

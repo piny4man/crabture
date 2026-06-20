@@ -58,6 +58,15 @@ pub type SelectionRect = (u32, u32, u32, u32);
 /// dimensions `(width, height)`, and the name of the output the overlay was on.
 pub type OverlayResult = (Option<SelectionRect>, (u32, u32), Option<String>);
 
+pub fn selection_rect_from_drag(start: (f64, f64), current: (f64, f64)) -> SelectionRect {
+    let x1 = start.0.min(current.0).round() as u32;
+    let y1 = start.1.min(current.1).round() as u32;
+    let x2 = start.0.max(current.0).round() as u32;
+    let y2 = start.1.max(current.1).round() as u32;
+
+    (x1, y1, x2.saturating_sub(x1), y2.saturating_sub(y1))
+}
+
 /// Run the fullscreen overlay and return `(selection, (surface_w, surface_h), output_name)`.
 /// `selection` is `Some((x, y, w, h))` in logical surface coordinates, or
 /// `None` if cancelled.  `output_name` identifies which monitor the overlay
@@ -844,12 +853,7 @@ impl PointerHandler for OverlayState {
                 PointerEventKind::Release { button, .. } => {
                     if button == 0x110 && self.selecting {
                         if let (Some((sx, sy)), Some((cx, cy))) = (self.start, self.current) {
-                            let x1 = sx.min(cx).round() as u32;
-                            let y1 = sy.min(cy).round() as u32;
-                            let x2 = sx.max(cx).round() as u32;
-                            let y2 = sy.max(cy).round() as u32;
-                            self.selection =
-                                Some((x1, y1, x2.saturating_sub(x1), y2.saturating_sub(y1)));
+                            self.selection = Some(selection_rect_from_drag((sx, sy), (cx, cy)));
                         }
                         self.selecting = false;
                         self.exit = true;
@@ -898,4 +902,29 @@ impl ProvidesRegistryState for OverlayState {
         &mut self.registry_state
     }
     registry_handlers![OutputState, SeatState];
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_selection_drag_from_any_direction() {
+        assert_eq!(
+            selection_rect_from_drag((100.0, 80.0), (20.0, 30.0)),
+            (20, 30, 80, 50)
+        );
+        assert_eq!(
+            selection_rect_from_drag((20.0, 30.0), (100.0, 80.0)),
+            (20, 30, 80, 50)
+        );
+    }
+
+    #[test]
+    fn rounds_selection_drag_to_logical_pixels() {
+        assert_eq!(
+            selection_rect_from_drag((10.4, 20.5), (25.6, 30.4)),
+            (10, 21, 16, 9)
+        );
+    }
 }

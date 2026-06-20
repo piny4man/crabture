@@ -16,6 +16,7 @@ pub enum SessionCommand {
 pub enum SessionOutcome {
     Continue,
     Cancelled,
+    CaptureAreaToClipboard,
     Unsupported(String),
 }
 
@@ -49,6 +50,9 @@ impl CaptureSession {
                 SessionOutcome::Continue
             }
             SessionCommand::Cancel => SessionOutcome::Cancelled,
+            SessionCommand::Capture if self.mode == CaptureMode::Area => {
+                SessionOutcome::CaptureAreaToClipboard
+            }
             SessionCommand::Capture => SessionOutcome::Unsupported(self.unsupported_message()),
         }
     }
@@ -84,5 +88,28 @@ mod tests {
             SessionOutcome::Continue
         );
         assert_eq!(session.mode(), CaptureMode::Window);
+    }
+
+    #[test]
+    fn area_capture_requests_clipboard_output() {
+        let mut session = CaptureSession::default();
+
+        assert_eq!(
+            session.handle(SessionCommand::Capture),
+            SessionOutcome::CaptureAreaToClipboard
+        );
+    }
+
+    #[test]
+    fn unsupported_modes_still_report_helpful_feedback() {
+        let mut session = CaptureSession::default();
+
+        session.handle(SessionCommand::SetMode(CaptureMode::Window));
+        assert_eq!(
+            session.handle(SessionCommand::Capture),
+            SessionOutcome::Unsupported(
+                "Window capture from the graphical toolbar is not implemented yet.".to_string()
+            )
+        );
     }
 }
