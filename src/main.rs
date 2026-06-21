@@ -12,14 +12,14 @@ use std::{
     time::Duration,
 };
 use time::OffsetDateTime;
-use xcap::Monitor;
+use xcap::{Monitor, Window};
 
 mod overlay;
 mod session;
 
 use session::{
     AreaSelection, CaptureSession, FullScreenSelection, GraphicalFormat, GraphicalPreferences,
-    OutputDestination, SaveLocationChoice, SessionOutcome,
+    OutputDestination, SaveLocationChoice, SessionOutcome, WindowSelection,
 };
 
 #[derive(Parser, Debug)]
@@ -104,6 +104,16 @@ struct PhysicalCrop {
 struct ClipboardDaemonCommand {
     exe: PathBuf,
     image_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WindowCandidate {
+    id: u32,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    minimized: bool,
 }
 
 impl ClipboardDaemonCommand {
@@ -222,7 +232,6 @@ fn cli_intent(cli: &Cli) -> CliIntent {
 fn run_graphical_screenshot_ui() -> Result<()> {
     let preferences = load_graphical_preferences().unwrap_or_default();
     let mut session = CaptureSession::with_preferences(preferences);
-    let all_screenshots = capture_all_outputs()?;
     let command =
         overlay::run_screenshot_hud(session.preferences()).context("graphical UI failed")?;
 
@@ -231,11 +240,18 @@ fn run_graphical_screenshot_ui() -> Result<()> {
         SessionOutcome::Cancelled => Ok(()),
         SessionOutcome::CaptureArea(selection, preferences) => {
             save_graphical_preferences(&preferences).ok();
+            let all_screenshots = capture_all_outputs()?;
             let img = selected_area_image(&all_screenshots, &selection)?;
+            save_graphical_capture(&img, preferences)
+        }
+        SessionOutcome::CaptureWindow(selection, preferences) => {
+            save_graphical_preferences(&preferences).ok();
+            let img = selected_window_image(&selection)?;
             save_graphical_capture(&img, preferences)
         }
         SessionOutcome::CaptureFullScreen(selection, preferences) => {
             save_graphical_preferences(&preferences).ok();
+            let all_screenshots = capture_all_outputs()?;
             let img = selected_full_screen_image(&all_screenshots, &selection)?;
             save_graphical_capture(img, preferences)
         }
@@ -545,6 +561,102 @@ fn selected_full_screen_image<'a>(
     }
 
     Ok(&all_screenshots[0].1)
+}
+
+fn selected_window_image(selection: &WindowSelection) -> Result<image::RgbaImage> {
+    let target = map_window_target_to_physical(selection)?;
+    let windows = Window::all().context(
+        "true window capture is unavailable on this desktop; try Area or Full Screen capture",
+    )?;
+
+    for window in windows {
+        let candidate = WindowCandidate {
+            id: window.id().unwrap_or_default(),
+            x: window.x().context("failed to read window position")?,
+            y: window.y().context("failed to read window position")?,
+            width: window.width().context("failed to read window size")?,
+            height: window.height().context("failed to read window size")?,
+            minimized: window.is_minimized().unwrap_or(false),
+        };
+
+        if window_candidate_contains_point(&candidate, target) {
+            let label = window_label(window.app_name().ok(), window.title().ok());
+            return window
+                .capture_image()
+                .with_context(|| format!("failed to capture selected window{label}"));
+        }
+    }
+
+    bail!("no capturable window found at the selected point; try clicking inside the window")
+}
+
+fn map_window_target_to_physical(selection: &WindowSelection) -> Result<(i32, i32)> {
+    let Some(ref target_output) = selection.output_name else {
+        return Ok((selection.point.0 as i32, selection.point.1 as i32));
+    };
+
+    let monitors = Monitor::all().context("failed to enumerate monitors for window targeting")?;
+    let Some(monitor) = monitors
+        .iter()
+        .find(|monitor| monitor.name().is_ok_and(|name| name == *target_output))
+    else {
+        return Ok((selection.point.0 as i32, selection.point.1 as i32));
+    };
+
+    let monitor_x = monitor.x().context("failed to read monitor x position")?;
+    let monitor_y = monitor.y().context("failed to read monitor y position")?;
+    let monitor_w = monitor.width().context("failed to read monitor width")?;
+    let monitor_h = monitor.height().context("failed to read monitor height")?;
+    Ok(map_window_target_to_monitor_bounds(
+        selection.point,
+        selection.surface_size,
+        (monitor_x, monitor_y, monitor_w, monitor_h),
+    ))
+}
+
+fn map_window_target_to_monitor_bounds(
+    point: (u32, u32),
+    surface_size: (u32, u32),
+    monitor: (i32, i32, u32, u32),
+) -> (i32, i32) {
+    let (monitor_x, monitor_y, monitor_w, monitor_h) = monitor;
+    let surface_w = surface_size.0.max(1);
+    let surface_h = surface_size.1.max(1);
+    let x = (f64::from(point.0) * f64::from(monitor_w) / f64::from(surface_w)).round() as i32;
+    let y = (f64::from(point.1) * f64::from(monitor_h) / f64::from(surface_h)).round() as i32;
+
+    (monitor_x + x, monitor_y + y)
+}
+
+fn window_candidate_contains_point(candidate: &WindowCandidate, point: (i32, i32)) -> bool {
+    !candidate.minimized
+        && candidate.width > 0
+        && candidate.height > 0
+        && point.0 >= candidate.x
+        && point.1 >= candidate.y
+        && point.0 < candidate.x + candidate.width as i32
+        && point.1 < candidate.y + candidate.height as i32
+}
+
+#[cfg(test)]
+fn selected_window_candidate(
+    candidates: &[WindowCandidate],
+    point: (i32, i32),
+) -> Option<&WindowCandidate> {
+    candidates
+        .iter()
+        .find(|candidate| window_candidate_contains_point(candidate, point))
+}
+
+fn window_label(app_name: Option<String>, title: Option<String>) -> String {
+    match (app_name, title) {
+        (Some(app), Some(title)) if !app.is_empty() && !title.is_empty() => {
+            format!(" ({app}: {title})")
+        }
+        (Some(app), _) if !app.is_empty() => format!(" ({app})"),
+        (_, Some(title)) if !title.is_empty() => format!(" ({title})"),
+        _ => String::new(),
+    }
 }
 
 fn map_selection_to_physical_crop(
@@ -904,10 +1016,96 @@ mod tests {
 
         assert_eq!(
             session.handle(SessionCommand::Capture),
-            SessionOutcome::Unsupported(
-                "Window capture from the graphical toolbar is not implemented yet.".to_string()
-            )
+            SessionOutcome::Unsupported("Click a window before capturing.".to_string())
         );
+    }
+
+    #[test]
+    fn maps_window_target_to_output_physical_coordinates() {
+        assert_eq!(
+            map_window_target_to_monitor_bounds((400, 225), (800, 450), (1920, 0, 1200, 675)),
+            (2520, 338)
+        );
+    }
+
+    #[test]
+    fn window_target_selection_ignores_minimized_or_empty_windows() {
+        let target = (60, 60);
+
+        assert!(!window_candidate_contains_point(
+            &WindowCandidate {
+                id: 1,
+                x: 10,
+                y: 10,
+                width: 100,
+                height: 100,
+                minimized: true,
+            },
+            target
+        ));
+        assert!(!window_candidate_contains_point(
+            &WindowCandidate {
+                id: 2,
+                x: 10,
+                y: 10,
+                width: 0,
+                height: 100,
+                minimized: false,
+            },
+            target
+        ));
+        assert!(window_candidate_contains_point(
+            &WindowCandidate {
+                id: 3,
+                x: 10,
+                y: 10,
+                width: 100,
+                height: 100,
+                minimized: false,
+            },
+            target
+        ));
+    }
+
+    #[test]
+    fn successful_window_backend_selection_uses_target_point() {
+        let candidates = [
+            WindowCandidate {
+                id: 2,
+                x: 50,
+                y: 50,
+                width: 100,
+                height: 100,
+                minimized: false,
+            },
+            WindowCandidate {
+                id: 1,
+                x: 0,
+                y: 0,
+                width: 500,
+                height: 500,
+                minimized: false,
+            },
+        ];
+
+        assert_eq!(
+            selected_window_candidate(&candidates, (75, 75)),
+            Some(&candidates[0])
+        );
+        assert_eq!(
+            selected_window_candidate(&candidates, (200, 200)),
+            Some(&candidates[1])
+        );
+        assert_eq!(selected_window_candidate(&candidates, (600, 600)), None);
+    }
+
+    #[test]
+    fn window_capture_error_labels_selected_window() {
+        assert_eq!(
+            window_label(Some("Terminal".to_string()), Some("cargo test".to_string())),
+            " (Terminal: cargo test)"
+        );
+        assert_eq!(window_label(None, None), "");
     }
 
     #[test]

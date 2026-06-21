@@ -8,7 +8,7 @@
 
 use crate::session::{
     AreaSelection, CaptureMode, FullScreenSelection, GraphicalPreferences, OutputDestination,
-    SaveLocationChoice, SessionCommand,
+    SaveLocationChoice, SessionCommand, WindowSelection,
 };
 use anyhow::{Context, Result};
 use smithay_client_toolkit::{
@@ -227,6 +227,22 @@ fn capture_full_screen_command(
     SessionCommand::CaptureFullScreen(FullScreenSelection { output_name }, preferences)
 }
 
+fn capture_window_command(
+    point: (u32, u32),
+    surface_size: (u32, u32),
+    output_name: Option<String>,
+    preferences: GraphicalPreferences,
+) -> SessionCommand {
+    SessionCommand::CaptureWindow(
+        WindowSelection {
+            point,
+            surface_size,
+            output_name,
+        },
+        preferences,
+    )
+}
+
 /// Run the fullscreen overlay and return `(selection, (surface_w, surface_h), output_name)`.
 /// `selection` is `Some((x, y, w, h))` in logical surface coordinates, or
 /// `None` if cancelled.  `output_name` identifies which monitor the overlay
@@ -281,6 +297,7 @@ pub fn run_selection_overlay() -> Result<OverlayResult> {
         current: None,
         selection: None,
         area_drag: None,
+        window_target: None,
 
         output_name: None,
 
@@ -357,6 +374,7 @@ pub fn run_screenshot_hud(default_preferences: GraphicalPreferences) -> Result<S
         current: None,
         selection: None,
         area_drag: None,
+        window_target: None,
 
         output_name: None,
 
@@ -411,6 +429,7 @@ struct OverlayState {
     current: Option<(f64, f64)>,
     selection: Option<(u32, u32, u32, u32)>,
     area_drag: Option<AreaDrag>,
+    window_target: Option<(u32, u32)>,
 
     /// Name of the output the overlay surface is on (e.g. "eDP-1", "HDMI-A-1").
     output_name: Option<String>,
@@ -446,7 +465,14 @@ impl OverlayState {
             CaptureMode::FullScreen => {
                 capture_full_screen_command(self.output_name.clone(), self.preferences)
             }
-            CaptureMode::Window => SessionCommand::Capture,
+            CaptureMode::Window => self.window_target.map_or(SessionCommand::Capture, |point| {
+                capture_window_command(
+                    point,
+                    (self.surface_w, self.surface_h),
+                    self.output_name.clone(),
+                    self.preferences,
+                )
+            }),
         }
     }
 
@@ -504,6 +530,11 @@ impl OverlayState {
         if self.preferences.mode == CaptureMode::Area {
             pixels.fill(OVERLAY_PIXEL);
             draw_selection(pixels, w, h, self.start, self.current, self.selection);
+        } else if self.preferences.mode == CaptureMode::Window {
+            pixels.fill(CLEAR_PIXEL);
+            if let Some(point) = self.window_target {
+                draw_window_target(pixels, w, h, point);
+            }
         } else {
             pixels.fill(CLEAR_PIXEL);
         }
@@ -530,6 +561,27 @@ impl OverlayState {
                 &button.label,
                 HUD_TEXT_PIXEL,
             );
+        }
+    }
+}
+
+fn draw_window_target(pixels: &mut [u32], w: usize, h: usize, point: (u32, u32)) {
+    let cx = point.0 as usize;
+    let cy = point.1 as usize;
+    let radius = 18usize;
+
+    if cy < h {
+        let left = cx.saturating_sub(radius);
+        let right = (cx + radius + 1).min(w);
+        for x in left..right {
+            pixels[cy * w + x] = BORDER_PIXEL;
+        }
+    }
+    if cx < w {
+        let top = cy.saturating_sub(radius);
+        let bottom = (cy + radius + 1).min(h);
+        for y in top..bottom {
+            pixels[y * w + cx] = BORDER_PIXEL;
         }
     }
 }
@@ -963,6 +1015,14 @@ impl KeyboardHandler for OverlayState {
                 self.hud_result = Some(self.capture_or_error_command());
                 self.exit = true;
             }
+            Keysym::space if self.preferences.mode == CaptureMode::Area => {
+                self.preferences.mode = CaptureMode::Window;
+                self.selection = None;
+                self.start = None;
+                self.current = None;
+                self.area_drag = None;
+                self.draw(qh);
+            }
             Keysym::a | Keysym::A => {
                 self.preferences.mode = CaptureMode::Area;
                 self.draw(qh);
@@ -1091,6 +1151,7 @@ impl PointerHandler for OverlayState {
                                             self.exit = true;
                                         }
                                         SessionCommand::CaptureArea(_, _)
+                                        | SessionCommand::CaptureWindow(_, _)
                                         | SessionCommand::CaptureFullScreen(_, _) => {}
                                     }
                                     return;
@@ -1122,6 +1183,16 @@ impl PointerHandler for OverlayState {
                                 };
                                 self.selecting = true;
                                 self.draw(qh);
+                            } else if mode == CaptureMode::Window {
+                                let point = (lx.round() as u32, ly.round() as u32);
+                                self.window_target = Some(point);
+                                self.hud_result = Some(capture_window_command(
+                                    point,
+                                    (self.surface_w, self.surface_h),
+                                    self.output_name.clone(),
+                                    self.preferences,
+                                ));
+                                self.exit = true;
                             }
                         }
                         if button == 0x111 {
@@ -1203,6 +1274,12 @@ impl PointerHandler for OverlayState {
                     }
                     needs_redraw = true;
                 }
+                PointerEventKind::Motion { .. }
+                    if self.hud_active && self.preferences.mode == CaptureMode::Window =>
+                {
+                    self.window_target = Some((lx.round() as u32, ly.round() as u32));
+                    needs_redraw = true;
+                }
                 _ => {}
             }
         }
@@ -1275,6 +1352,42 @@ mod tests {
                 preferences
             )
         );
+    }
+
+    #[test]
+    fn window_command_carries_target_point() {
+        let preferences = GraphicalPreferences {
+            mode: CaptureMode::Window,
+            ..GraphicalPreferences::default()
+        };
+
+        assert_eq!(
+            capture_window_command(
+                (120, 80),
+                (800, 600),
+                Some("eDP-1".to_string()),
+                preferences
+            ),
+            SessionCommand::CaptureWindow(
+                WindowSelection {
+                    point: (120, 80),
+                    surface_size: (800, 600),
+                    output_name: Some("eDP-1".to_string()),
+                },
+                preferences
+            )
+        );
+    }
+
+    #[test]
+    fn draws_window_target_marker() {
+        let mut pixels = vec![CLEAR_PIXEL; 20 * 20];
+
+        draw_window_target(&mut pixels, 20, 20, (10, 10));
+
+        assert_eq!(pixels[10 * 20 + 10], BORDER_PIXEL);
+        assert_eq!(pixels[10 * 20], BORDER_PIXEL);
+        assert_eq!(pixels[10], BORDER_PIXEL);
     }
 
     #[test]

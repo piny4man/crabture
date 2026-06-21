@@ -10,6 +10,13 @@ pub struct FullScreenSelection {
     pub output_name: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowSelection {
+    pub point: (u32, u32),
+    pub surface_size: (u32, u32),
+    pub output_name: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputDestination {
     Clipboard,
@@ -137,6 +144,7 @@ pub enum SessionCommand {
     SetFormat(GraphicalFormat),
     SetLocation(SaveLocationChoice),
     CaptureArea(AreaSelection, GraphicalPreferences),
+    CaptureWindow(WindowSelection, GraphicalPreferences),
     CaptureFullScreen(FullScreenSelection, GraphicalPreferences),
     Capture,
     Cancel,
@@ -147,6 +155,7 @@ pub enum SessionOutcome {
     Continue,
     Cancelled,
     CaptureArea(AreaSelection, GraphicalPreferences),
+    CaptureWindow(WindowSelection, GraphicalPreferences),
     CaptureFullScreen(FullScreenSelection, GraphicalPreferences),
     Unsupported(String),
 }
@@ -206,6 +215,15 @@ impl CaptureSession {
             SessionCommand::CaptureArea(_, _) => {
                 SessionOutcome::Unsupported(self.unsupported_message())
             }
+            SessionCommand::CaptureWindow(selection, preferences)
+                if self.preferences.mode == CaptureMode::Window =>
+            {
+                self.preferences = preferences;
+                SessionOutcome::CaptureWindow(selection, preferences)
+            }
+            SessionCommand::CaptureWindow(_, _) => {
+                SessionOutcome::Unsupported(self.unsupported_message())
+            }
             SessionCommand::CaptureFullScreen(selection, preferences)
                 if self.preferences.mode == CaptureMode::FullScreen =>
             {
@@ -226,7 +244,7 @@ impl CaptureSession {
     fn unsupported_message(&self) -> String {
         match self.preferences.mode {
             CaptureMode::Area => "Area capture from the graphical toolbar is not implemented yet. Use --select for direct area capture.",
-            CaptureMode::Window => "Window capture from the graphical toolbar is not implemented yet.",
+            CaptureMode::Window => "Click a window before capturing.",
             CaptureMode::FullScreen => "Full screen capture could not determine a target display.",
         }
         .to_string()
@@ -302,6 +320,28 @@ mod tests {
     }
 
     #[test]
+    fn window_capture_requests_target_point() {
+        let mut session = CaptureSession::with_preferences(GraphicalPreferences {
+            mode: CaptureMode::Window,
+            ..GraphicalPreferences::default()
+        });
+        let selection = WindowSelection {
+            point: (120, 80),
+            surface_size: (800, 600),
+            output_name: Some("eDP-1".to_string()),
+        };
+        let preferences = session.preferences();
+
+        assert_eq!(
+            session.handle(SessionCommand::CaptureWindow(
+                selection.clone(),
+                preferences
+            )),
+            SessionOutcome::CaptureWindow(selection, preferences)
+        );
+    }
+
+    #[test]
     fn output_format_and_location_changes_continue_session() {
         let mut session = CaptureSession::default();
 
@@ -345,9 +385,7 @@ mod tests {
         session.handle(SessionCommand::SetMode(CaptureMode::Window));
         assert_eq!(
             session.handle(SessionCommand::Capture),
-            SessionOutcome::Unsupported(
-                "Window capture from the graphical toolbar is not implemented yet.".to_string()
-            )
+            SessionOutcome::Unsupported("Click a window before capturing.".to_string())
         );
     }
 }
