@@ -360,6 +360,7 @@ pub fn run_selection_overlay() -> Result<OverlayResult> {
         area_drag: None,
         window_target: None,
         hovered_button: None,
+        toolbar_cache: None,
 
         output_name: None,
 
@@ -441,6 +442,7 @@ pub fn run_screenshot_hud(default_preferences: GraphicalPreferences) -> Result<S
         area_drag: None,
         window_target: None,
         hovered_button: None,
+        toolbar_cache: None,
 
         output_name: None,
 
@@ -488,6 +490,20 @@ fn teardown_layer_surface(conn: &Connection, layer: &LayerSurface) {
 // State
 // ---------------------------------------------------------------------------
 
+/// A toolbar pixmap together with the inputs it was rendered for, so we can
+/// reuse it across frames and only re-rasterize when something actually
+/// affecting the toolbar changes.
+struct ToolbarCache {
+    prefs: GraphicalPreferences,
+    scale: usize,
+    hovered: Option<usize>,
+    lw: usize,
+    lh: usize,
+    pixmap: tiny_skia::Pixmap,
+    ox: i32,
+    oy: i32,
+}
+
 struct OverlayState {
     registry_state: RegistryState,
     seat_state: SeatState,
@@ -515,6 +531,11 @@ struct OverlayState {
     window_target: Option<(u32, u32)>,
     /// Index of the toolbar button under the pointer, for hover styling.
     hovered_button: Option<usize>,
+    /// Cached rendered toolbar pixmap, rebuilt only when its inputs change
+    /// (prefs / scale / hover / surface size).  Window-target and area-drag
+    /// motion redraw the canvas every frame but must not re-rasterize the
+    /// toolbar's SVG icons and text each time.
+    toolbar_cache: Option<ToolbarCache>,
 
     /// Name of the output the overlay surface is on (e.g. "eDP-1", "HDMI-A-1").
     output_name: Option<String>,
@@ -668,18 +689,23 @@ impl OverlayState {
             .attach_to(self.layer.wl_surface())
             .expect("buffer attach");
 
-        // Request frame callback BEFORE commit so we get notified for next frame.
-        if self.selecting {
-            self.layer
-                .wl_surface()
-                .frame(qh, self.layer.wl_surface().clone());
-            self.frame_pending = true;
-        }
+        // Throttle redraws to the compositor's frame clock: always request a
+        // callback for the next frame so motion-driven redraws (HUD hover,
+        // window crosshair, area drag) coalesce into one repaint per frame.
+        // Without this the HUD path — where `selecting` is never set — redrew
+        // and committed on every pointer-motion event, flooding the Wayland
+        // connection until the compositor dropped it (Broken pipe) and lagging
+        // badly.  The frame handler only redraws when `dirty`, so requesting a
+        // callback unconditionally is self-terminating once motion stops.
+        self.layer
+            .wl_surface()
+            .frame(qh, self.layer.wl_surface().clone());
+        self.frame_pending = true;
 
         self.layer.commit();
     }
 
-    fn draw_hud(&self, pixels: &mut [u32], lw: usize, lh: usize, scale: usize) {
+    fn draw_hud(&mut self, pixels: &mut [u32], lw: usize, lh: usize, scale: usize) {
         let pw = lw * scale;
         let ph = lh * scale;
         if self.preferences.mode == CaptureMode::Area {
@@ -707,15 +733,38 @@ impl OverlayState {
             pixels.fill(CLEAR_PIXEL);
         }
 
-        // Render the macOS-style toolbar into a small anti-aliased pixmap and
-        // composite it over the canvas.  Layout is in logical coordinates so it
-        // stays in sync with the pointer hit-test; the renderer scales it to the
-        // physical buffer resolution.
-        let layout = render::toolbar_layout(lw, lh, self.preferences);
-        if let Some((toolbar, ox, oy)) =
-            render::render_toolbar(&layout, self.preferences, scale, self.hovered_button)
-        {
-            render::blit_argb(pixels, pw, ph, &toolbar, ox, oy);
+        // Composite the macOS-style toolbar over the canvas.  Rasterizing it
+        // (SVG icons + anti-aliased text) is comparatively expensive, so cache
+        // the rendered pixmap and only rebuild when an input that affects the
+        // toolbar changes — never on plain window-target / area-drag motion,
+        // which redraw the canvas every frame.  Layout is in logical
+        // coordinates so it stays in sync with the pointer hit-test; the
+        // renderer scales it to the physical buffer resolution.
+        let cache_hit = self.toolbar_cache.as_ref().is_some_and(|c| {
+            c.prefs == self.preferences
+                && c.scale == scale
+                && c.hovered == self.hovered_button
+                && c.lw == lw
+                && c.lh == lh
+        });
+        if !cache_hit {
+            let layout = render::toolbar_layout(lw, lh, self.preferences);
+            self.toolbar_cache =
+                render::render_toolbar(&layout, self.preferences, scale, self.hovered_button).map(
+                    |(pixmap, ox, oy)| ToolbarCache {
+                        prefs: self.preferences,
+                        scale,
+                        hovered: self.hovered_button,
+                        lw,
+                        lh,
+                        pixmap,
+                        ox,
+                        oy,
+                    },
+                );
+        }
+        if let Some(c) = &self.toolbar_cache {
+            render::blit_argb(pixels, pw, ph, &c.pixmap, c.ox, c.oy);
         }
     }
 }
