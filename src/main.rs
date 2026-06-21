@@ -8,6 +8,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::{self, Command},
+    sync::OnceLock,
     thread::sleep,
     time::Duration,
 };
@@ -644,10 +645,14 @@ fn selected_hyprland_window_image(
             }
         })
         .collect::<Vec<_>>();
-    let Some(output) = output_for_logical_rect(
-        &logical_outputs,
+    let capture_rect = expand_logical_rect(
         (client.x, client.y, client.width, client.height),
-    ) else {
+        hyprland_border_size().unwrap_or(0),
+    );
+    let Some(output) = output_for_logical_rect(&logical_outputs, capture_rect) else {
+        return Ok(None);
+    };
+    let Some(capture_rect) = clamp_logical_rect_to_output(capture_rect, output) else {
         return Ok(None);
     };
 
@@ -663,10 +668,10 @@ fn selected_hyprland_window_image(
     let screenshot = screenshot.into_rgba8();
 
     let relative_rect = (
-        (client.x - output.x).max(0) as u32,
-        (client.y - output.y).max(0) as u32,
-        client.width,
-        client.height,
+        (capture_rect.0 - output.x).max(0) as u32,
+        (capture_rect.1 - output.y).max(0) as u32,
+        capture_rect.2,
+        capture_rect.3,
     );
     let crop = map_selection_to_physical_crop(
         relative_rect,
@@ -677,6 +682,62 @@ fn selected_hyprland_window_image(
     Ok(Some(
         image::imageops::crop_imm(&screenshot, crop.x, crop.y, crop.w, crop.h).to_image(),
     ))
+}
+
+fn hyprland_border_size() -> Option<u32> {
+    static CACHED: OnceLock<Option<u32>> = OnceLock::new();
+    *CACHED.get_or_init(fetch_hyprland_border_size)
+}
+
+fn fetch_hyprland_border_size() -> Option<u32> {
+    let output = Command::new("hyprctl")
+        .args(["-j", "getoption", "general:border_size"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    parse_hyprland_border_size(&value)
+}
+
+fn parse_hyprland_border_size(value: &serde_json::Value) -> Option<u32> {
+    let border_size = value.get("int")?.as_i64()?;
+    border_size.try_into().ok()
+}
+
+fn expand_logical_rect(rect: (i32, i32, u32, u32), amount: u32) -> (i32, i32, u32, u32) {
+    if amount == 0 {
+        return rect;
+    }
+
+    let amount_i32 = i32::try_from(amount).unwrap_or(i32::MAX);
+    (
+        rect.0.saturating_sub(amount_i32),
+        rect.1.saturating_sub(amount_i32),
+        rect.2.saturating_add(amount.saturating_mul(2)),
+        rect.3.saturating_add(amount.saturating_mul(2)),
+    )
+}
+
+fn clamp_logical_rect_to_output(
+    rect: (i32, i32, u32, u32),
+    output: &LogicalOutput,
+) -> Option<(i32, i32, u32, u32)> {
+    let (x, y, width, height) = rect;
+    let left = x.max(output.x);
+    let top = y.max(output.y);
+    let right = logical_rect_end(x, width).min(logical_rect_end(output.x, output.width));
+    let bottom = logical_rect_end(y, height).min(logical_rect_end(output.y, output.height));
+
+    let width = u32::try_from(right - left).ok()?;
+    let height = u32::try_from(bottom - top).ok()?;
+    (width > 0 && height > 0).then_some((left, top, width, height))
+}
+
+fn logical_rect_end(start: i32, size: u32) -> i32 {
+    start.saturating_add(i32::try_from(size).unwrap_or(i32::MAX))
 }
 
 fn selected_hyprland_client(
@@ -829,8 +890,8 @@ fn logical_overlap_area(output: &LogicalOutput, rect: (i32, i32, u32, u32)) -> i
     let (x, y, width, height) = rect;
     let left = x.max(output.x);
     let top = y.max(output.y);
-    let right = (x + width as i32).min(output.x + output.width as i32);
-    let bottom = (y + height as i32).min(output.y + output.height as i32);
+    let right = logical_rect_end(x, width).min(logical_rect_end(output.x, output.width));
+    let bottom = logical_rect_end(y, height).min(logical_rect_end(output.y, output.height));
 
     (right - left).max(0) * (bottom - top).max(0)
 }
@@ -1627,6 +1688,49 @@ mod tests {
             " (Terminal: cargo test)"
         );
         assert_eq!(window_label(None, None), "");
+    }
+
+    #[test]
+    fn expands_hyprland_window_capture_for_configured_border() {
+        assert_eq!(
+            expand_logical_rect((100, 200, 640, 480), 2),
+            (98, 198, 644, 484)
+        );
+        assert_eq!(
+            expand_logical_rect((100, 200, 640, 480), 0),
+            (100, 200, 640, 480)
+        );
+    }
+
+    #[test]
+    fn clamps_hyprland_window_capture_to_output_bounds() {
+        let output = LogicalOutput {
+            name: "eDP-1".to_string(),
+            x: 0,
+            y: 0,
+            width: 1200,
+            height: 800,
+        };
+
+        assert_eq!(
+            clamp_logical_rect_to_output((-2, 10, 102, 50), &output),
+            Some((0, 10, 100, 50))
+        );
+        assert_eq!(
+            clamp_logical_rect_to_output((1400, 10, 100, 50), &output),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_hyprland_border_size_option() {
+        let value = serde_json::json!({ "int": 3 });
+        let disabled = serde_json::json!({ "int": 0 });
+        let invalid = serde_json::json!({ "int": -1 });
+
+        assert_eq!(parse_hyprland_border_size(&value), Some(3));
+        assert_eq!(parse_hyprland_border_size(&disabled), Some(0));
+        assert_eq!(parse_hyprland_border_size(&invalid), None);
     }
 
     #[test]

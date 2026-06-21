@@ -29,7 +29,7 @@ use smithay_client_toolkit::{
         WaylandSurface,
         wlr_layer::{
             Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
-            LayerSurfaceConfigure,
+            LayerSurfaceConfigure, SurfaceKind,
         },
     },
     shm::{Shm, ShmHandler, slot::SlotPool},
@@ -384,7 +384,9 @@ pub fn run_selection_overlay() -> Result<OverlayResult> {
     }
 
     let surf = (state.surface_w, state.surface_h);
-    let output_name = state.output_name;
+    let output_name = state.output_name.clone();
+    teardown_layer_surface(&conn, &state.layer);
+    event_queue.roundtrip(&mut state).ok();
 
     if state.cancelled {
         return Ok((None, surf, output_name));
@@ -461,10 +463,23 @@ pub fn run_screenshot_hud(default_preferences: GraphicalPreferences) -> Result<S
     }
 
     if state.cancelled {
+        teardown_layer_surface(&conn, &state.layer);
+        event_queue.roundtrip(&mut state).ok();
         return Ok(SessionCommand::Cancel);
     }
 
-    Ok(state.hud_result.unwrap_or(SessionCommand::Cancel))
+    let result = state.hud_result.clone().unwrap_or(SessionCommand::Cancel);
+    teardown_layer_surface(&conn, &state.layer);
+    event_queue.roundtrip(&mut state).ok();
+    Ok(result)
+}
+
+fn teardown_layer_surface(conn: &Connection, layer: &LayerSurface) {
+    if let SurfaceKind::Wlr(layer_surface) = layer.kind() {
+        layer_surface.destroy();
+    }
+    layer.wl_surface().destroy();
+    conn.flush().ok();
 }
 
 // ---------------------------------------------------------------------------
