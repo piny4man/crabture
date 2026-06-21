@@ -243,6 +243,22 @@ fn capture_window_command(
     )
 }
 
+fn mode_selection_command(
+    mode: CaptureMode,
+    output_name: Option<String>,
+    preferences: GraphicalPreferences,
+) -> SessionCommand {
+    let preferences = GraphicalPreferences {
+        mode,
+        ..preferences
+    };
+
+    match mode {
+        CaptureMode::Area | CaptureMode::Window => SessionCommand::SetMode(mode),
+        CaptureMode::FullScreen => capture_full_screen_command(output_name, preferences),
+    }
+}
+
 /// Run the fullscreen overlay and return `(selection, (surface_w, surface_h), output_name)`.
 /// `selection` is `Some((x, y, w, h))` in logical surface coordinates, or
 /// `None` if cancelled.  `output_name` identifies which monitor the overlay
@@ -448,6 +464,20 @@ struct OverlayState {
 }
 
 impl OverlayState {
+    fn activate_mode(&mut self, mode: CaptureMode, qh: &QueueHandle<Self>) {
+        match mode_selection_command(mode, self.output_name.clone(), self.preferences) {
+            SessionCommand::SetMode(mode) => {
+                self.preferences.mode = mode;
+                self.draw(qh);
+            }
+            command @ SessionCommand::CaptureFullScreen(_, _) => {
+                self.hud_result = Some(command);
+                self.exit = true;
+            }
+            _ => unreachable!("mode selection only emits mode or full-screen capture commands"),
+        }
+    }
+
     fn capture_or_error_command(&self) -> SessionCommand {
         match self.preferences.mode {
             CaptureMode::Area => {
@@ -1024,16 +1054,13 @@ impl KeyboardHandler for OverlayState {
                 self.draw(qh);
             }
             Keysym::a | Keysym::A => {
-                self.preferences.mode = CaptureMode::Area;
-                self.draw(qh);
+                self.activate_mode(CaptureMode::Area, qh);
             }
             Keysym::w | Keysym::W => {
-                self.preferences.mode = CaptureMode::Window;
-                self.draw(qh);
+                self.activate_mode(CaptureMode::Window, qh);
             }
             Keysym::f | Keysym::F => {
-                self.preferences.mode = CaptureMode::FullScreen;
-                self.draw(qh);
+                self.activate_mode(CaptureMode::FullScreen, qh);
             }
             Keysym::o | Keysym::O => {
                 self.preferences.output = self.preferences.output.next();
@@ -1127,8 +1154,7 @@ impl PointerHandler for OverlayState {
                                 if inside_x && inside_y {
                                     match hud_button.command {
                                         SessionCommand::SetMode(mode) => {
-                                            self.preferences.mode = mode;
-                                            self.draw(qh);
+                                            self.activate_mode(mode, qh);
                                         }
                                         SessionCommand::SetOutput(output) => {
                                             self.preferences.output = output;
@@ -1376,6 +1402,48 @@ mod tests {
                 },
                 preferences
             )
+        );
+    }
+
+    #[test]
+    fn full_screen_mode_selection_captures_immediately() {
+        let preferences = GraphicalPreferences {
+            output: OutputDestination::Save,
+            format: crate::session::GraphicalFormat::Jpg,
+            location: SaveLocationChoice::CurrentDirectory,
+            mode: CaptureMode::Area,
+        };
+        let expected_preferences = GraphicalPreferences {
+            mode: CaptureMode::FullScreen,
+            ..preferences
+        };
+
+        assert_eq!(
+            mode_selection_command(
+                CaptureMode::FullScreen,
+                Some("eDP-1".to_string()),
+                preferences,
+            ),
+            SessionCommand::CaptureFullScreen(
+                FullScreenSelection {
+                    output_name: Some("eDP-1".to_string()),
+                },
+                expected_preferences,
+            )
+        );
+    }
+
+    #[test]
+    fn area_and_window_mode_selection_still_changes_mode() {
+        let preferences = GraphicalPreferences::default();
+
+        assert_eq!(
+            mode_selection_command(CaptureMode::Area, Some("eDP-1".to_string()), preferences),
+            SessionCommand::SetMode(CaptureMode::Area)
+        );
+        assert_eq!(
+            mode_selection_command(CaptureMode::Window, Some("eDP-1".to_string()), preferences),
+            SessionCommand::SetMode(CaptureMode::Window)
         );
     }
 
