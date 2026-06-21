@@ -264,8 +264,13 @@ fn run_graphical_screenshot_ui() -> Result<()> {
     // instead of re-capturing at logical resolution.
     let snapshots = capture_all_outputs()?;
 
-    let command =
-        overlay::run_screenshot_hud(session.preferences()).context("graphical UI failed")?;
+    // Enumerate on-screen windows (global logical rects, in capture-selection
+    // order) so the overlay can highlight the window the pointer is over in
+    // window mode.  Best-effort: an empty list just means no highlight.
+    let window_rects = enumerate_window_rects();
+
+    let command = overlay::run_screenshot_hud(session.preferences(), window_rects)
+        .context("graphical UI failed")?;
 
     match session.handle(command) {
         SessionOutcome::Continue => Ok(()),
@@ -1026,6 +1031,68 @@ fn selected_window_candidate<'a>(
             .iter()
             .find(|candidate| window_candidate_contains_point(candidate, *point))
     })
+}
+
+/// Enumerate on-screen windows as global logical rectangles, ordered so the
+/// first rectangle containing a point is the one a window capture there would
+/// select.  Mirrors the capture-time selection (Hyprland clients sorted by
+/// focus history, else `xcap` window order) so the overlay highlight matches
+/// what will actually be captured.  Returns an empty list when window
+/// enumeration is unavailable, so the highlight simply degrades to nothing.
+fn enumerate_window_rects() -> Vec<(i32, i32, u32, u32)> {
+    if let Some(rects) = hyprland_window_rects() {
+        return rects;
+    }
+    generic_window_rects()
+}
+
+fn hyprland_window_rects() -> Option<Vec<(i32, i32, u32, u32)>> {
+    let is_hyprland = env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some()
+        || env::var("XDG_CURRENT_DESKTOP").is_ok_and(|value| value == "Hyprland");
+    if !is_hyprland {
+        return None;
+    }
+
+    let output = Command::new("hyprctl")
+        .args(["-j", "clients"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let clients: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    // Highlight is purely spatial, so include every monitor's active workspace
+    // (target_output_name = None); windows off the overlay's output fall
+    // outside it and are never hovered.
+    let active_workspace_ids = hyprland_active_workspace_ids(None).unwrap_or_default();
+    let candidates = hyprland_window_candidates(&clients, &active_workspace_ids);
+    Some(
+        candidates
+            .into_iter()
+            .map(|c| (c.x, c.y, c.width, c.height))
+            .collect(),
+    )
+}
+
+fn generic_window_rects() -> Vec<(i32, i32, u32, u32)> {
+    let Ok(windows) = Window::all() else {
+        return Vec::new();
+    };
+    windows
+        .into_iter()
+        .filter_map(|window| {
+            if window.is_minimized().unwrap_or(false) {
+                return None;
+            }
+            Some((
+                window.x().ok()?,
+                window.y().ok()?,
+                window.width().ok()?,
+                window.height().ok()?,
+            ))
+        })
+        .collect()
 }
 
 fn window_label(app_name: Option<String>, title: Option<String>) -> String {

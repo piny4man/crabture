@@ -51,6 +51,12 @@ const OVERLAY_PIXEL: u32 = 0x9900_0000;
 const CLEAR_PIXEL: u32 = 0x0000_0000;
 /// Border: solid white, premultiplied.
 const BORDER_PIXEL: u32 = 0xFFFF_FFFF;
+/// Window-highlight fill: accent blue (10,132,255) at ~22% opacity,
+/// premultiplied ARGB8888-LE.  Composited over the desktop so the hovered
+/// window gets a translucent blue tint.
+const HIGHLIGHT_FILL_PIXEL: u32 = 0x3802_1D38;
+/// Window-highlight border: solid accent blue, premultiplied ARGB8888-LE.
+const HIGHLIGHT_BORDER_PIXEL: u32 = 0xFF0A_84FF;
 
 /// A rectangle in logical surface coordinates: (x, y, width, height).
 pub type SelectionRect = (u32, u32, u32, u32);
@@ -361,6 +367,9 @@ pub fn run_selection_overlay() -> Result<OverlayResult> {
         window_target: None,
         hovered_button: None,
         toolbar_cache: None,
+        window_rects: Vec::new(),
+        output_origin: (0, 0),
+        highlighted_window: None,
 
         output_name: None,
 
@@ -396,7 +405,10 @@ pub fn run_selection_overlay() -> Result<OverlayResult> {
     Ok((state.selection, surf, output_name))
 }
 
-pub fn run_screenshot_hud(default_preferences: GraphicalPreferences) -> Result<SessionCommand> {
+pub fn run_screenshot_hud(
+    default_preferences: GraphicalPreferences,
+    window_rects: Vec<(i32, i32, u32, u32)>,
+) -> Result<SessionCommand> {
     let conn = Connection::connect_to_env().context("failed to connect to Wayland")?;
     let (globals, mut event_queue) =
         registry_queue_init(&conn).context("failed to initialise Wayland registry")?;
@@ -443,6 +455,9 @@ pub fn run_screenshot_hud(default_preferences: GraphicalPreferences) -> Result<S
         window_target: None,
         hovered_button: None,
         toolbar_cache: None,
+        window_rects,
+        output_origin: (0, 0),
+        highlighted_window: None,
 
         output_name: None,
 
@@ -536,6 +551,17 @@ struct OverlayState {
     /// motion redraw the canvas every frame but must not re-rasterize the
     /// toolbar's SVG icons and text each time.
     toolbar_cache: Option<ToolbarCache>,
+    /// On-screen windows as global logical rectangles, ordered like the
+    /// capture's window selection, used to highlight the hovered window in
+    /// window mode.  Empty when window enumeration was unavailable.
+    window_rects: Vec<(i32, i32, u32, u32)>,
+    /// Logical position of the overlay's output, used to translate the
+    /// surface-local pointer into the global coordinate space `window_rects`
+    /// live in.  Seeded from `OutputInfo::logical_position` on `surface_enter`.
+    output_origin: (i32, i32),
+    /// The hovered window in surface-local logical coordinates, highlighted in
+    /// window mode.  `None` when the pointer is over empty space or the toolbar.
+    highlighted_window: Option<(i32, i32, u32, u32)>,
 
     /// Name of the output the overlay surface is on (e.g. "eDP-1", "HDMI-A-1").
     output_name: Option<String>,
@@ -623,6 +649,23 @@ impl OverlayState {
         let hovered = render::button_at(&layout, lx, ly);
         if hovered != self.hovered_button {
             self.hovered_button = hovered;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Recompute which window the pointer is over (window mode).  The pointer is
+    /// suppressed while over the toolbar so we never highlight a window behind
+    /// it.  Returns `true` when the highlight changed.
+    fn update_window_highlight(&mut self, lx: f64, ly: f64) -> bool {
+        let highlight = if self.hovered_button.is_some() {
+            None
+        } else {
+            window_rect_at_point(&self.window_rects, self.output_origin, (lx, ly))
+        };
+        if highlight != self.highlighted_window {
+            self.highlighted_window = highlight;
             true
         } else {
             false
@@ -720,7 +763,9 @@ impl OverlayState {
             );
         } else if self.preferences.mode == CaptureMode::Window {
             pixels.fill(CLEAR_PIXEL);
-            if let Some(point) = self.window_target {
+            if let Some(rect) = self.highlighted_window {
+                draw_window_highlight(pixels, pw, ph, rect, scale);
+            } else if let Some(point) = self.window_target {
                 draw_window_target(
                     pixels,
                     pw,
@@ -778,6 +823,76 @@ fn scaled_point(point: Option<(f64, f64)>, scale: usize) -> Option<(f64, f64)> {
 fn scaled_rect(rect: Option<SelectionRect>, scale: usize) -> Option<SelectionRect> {
     let s = scale as u32;
     rect.map(|(x, y, w, h)| (x * s, y * s, w * s, h * s))
+}
+
+/// Find the window under a surface-local logical `point` and return it in
+/// surface-local logical coordinates.  `window_rects` are global logical rects
+/// in capture-selection order; `origin` is the overlay output's logical
+/// position.  Mirrors the capture's "first window containing the point" rule so
+/// the highlight matches what will be captured.
+fn window_rect_at_point(
+    window_rects: &[(i32, i32, u32, u32)],
+    origin: (i32, i32),
+    point: (f64, f64),
+) -> Option<(i32, i32, u32, u32)> {
+    let gx = origin.0 + point.0.round() as i32;
+    let gy = origin.1 + point.1.round() as i32;
+    window_rects
+        .iter()
+        .copied()
+        .find(|(x, y, w, h)| {
+            *w > 0 && *h > 0 && gx >= *x && gy >= *y && gx < x + *w as i32 && gy < y + *h as i32
+        })
+        .map(|(x, y, w, h)| (x - origin.0, y - origin.1, w, h))
+}
+
+/// Fill the hovered window's rectangle with a translucent accent tint and a
+/// solid accent border.  `rect` is in surface-local logical coordinates (its
+/// origin may be negative if the window extends off the output's top/left); it
+/// is scaled to physical pixels and clamped to the buffer.
+fn draw_window_highlight(
+    pixels: &mut [u32],
+    w: usize,
+    h: usize,
+    rect: (i32, i32, u32, u32),
+    scale: usize,
+) {
+    let s = scale as i32;
+    let left = (rect.0 * s).clamp(0, w as i32);
+    let top = (rect.1 * s).clamp(0, h as i32);
+    let right = ((rect.0 + rect.2 as i32) * s).clamp(0, w as i32);
+    let bottom = ((rect.1 + rect.3 as i32) * s).clamp(0, h as i32);
+    if right <= left || bottom <= top {
+        return;
+    }
+    let (left, top, right, bottom) = (left as usize, top as usize, right as usize, bottom as usize);
+
+    for y in top..bottom {
+        let row = y * w;
+        for px in &mut pixels[row + left..row + right] {
+            *px = HIGHLIGHT_FILL_PIXEL;
+        }
+    }
+
+    let border = scale.max(1) * 2;
+    for y in top..bottom {
+        let row = y * w;
+        let on_h_edge = y < top + border || y >= bottom.saturating_sub(border);
+        if on_h_edge {
+            for px in &mut pixels[row + left..row + right] {
+                *px = HIGHLIGHT_BORDER_PIXEL;
+            }
+        } else {
+            let left_edge = (left + border).min(right);
+            for px in &mut pixels[row + left..row + left_edge] {
+                *px = HIGHLIGHT_BORDER_PIXEL;
+            }
+            let right_edge = right.saturating_sub(border).max(left);
+            for px in &mut pixels[row + right_edge..row + right] {
+                *px = HIGHLIGHT_BORDER_PIXEL;
+            }
+        }
+    }
 }
 
 fn draw_window_target(pixels: &mut [u32], w: usize, h: usize, point: (usize, usize), scale: usize) {
@@ -904,6 +1019,9 @@ impl CompositorHandler for OverlayState {
         // `scale_factor_changed` event will correct it if it differs).
         if let Some(info) = self.output_state.info(output) {
             self.output_name = info.name;
+            // Translate window rects (global logical) into this output's local
+            // space when highlighting the hovered window.
+            self.output_origin = info.logical_position.unwrap_or((0, 0));
             let scale = info.scale_factor.max(1);
             if scale != self.buffer_scale {
                 self.buffer_scale = scale;
@@ -1304,11 +1422,12 @@ impl PointerHandler for OverlayState {
                     needs_redraw = true;
                 }
                 PointerEventKind::Motion { .. } if self.hud_active => {
-                    if self.preferences.mode == CaptureMode::Window {
-                        self.window_target = Some((lx.round() as u32, ly.round() as u32));
+                    if self.update_hover(lx, ly) {
                         needs_redraw = true;
                     }
-                    if self.update_hover(lx, ly) {
+                    if self.preferences.mode == CaptureMode::Window {
+                        self.window_target = Some((lx.round() as u32, ly.round() as u32));
+                        self.update_window_highlight(lx, ly);
                         needs_redraw = true;
                     }
                 }
@@ -1579,6 +1698,64 @@ mod tests {
         // buffer edges without overflowing.
         assert_eq!(pixels[20 * 40], BORDER_PIXEL);
         assert_eq!(pixels[20 * 40 + 39], BORDER_PIXEL);
+    }
+
+    #[test]
+    fn highlights_the_first_window_containing_the_point() {
+        // Two overlapping windows; the first in order wins, mirroring capture.
+        let rects = [(0, 0, 200, 150), (50, 50, 200, 150)];
+        assert_eq!(
+            window_rect_at_point(&rects, (0, 0), (60.0, 60.0)),
+            Some((0, 0, 200, 150)),
+        );
+        // A point only inside the second window selects it.
+        assert_eq!(
+            window_rect_at_point(&rects, (0, 0), (220.0, 160.0)),
+            Some((50, 50, 200, 150)),
+        );
+        // Empty space highlights nothing.
+        assert_eq!(window_rect_at_point(&rects, (0, 0), (400.0, 400.0)), None);
+    }
+
+    #[test]
+    fn highlight_hit_test_maps_through_output_origin() {
+        // The overlay's output sits at logical (1920, 0); a window at global
+        // (2000, 100) is hit by the surface-local point (80, 100) and returned
+        // in surface-local coordinates.
+        let rects = [(2000, 100, 300, 200)];
+        assert_eq!(
+            window_rect_at_point(&rects, (1920, 0), (100.0, 150.0)),
+            Some((80, 100, 300, 200)),
+        );
+        // The same surface point on a single-output desktop (origin 0,0) misses.
+        assert_eq!(window_rect_at_point(&rects, (0, 0), (100.0, 150.0)), None);
+    }
+
+    #[test]
+    fn draws_window_highlight_fill_and_border() {
+        let mut pixels = vec![CLEAR_PIXEL; 40 * 40];
+
+        draw_window_highlight(&mut pixels, 40, 40, (10, 10, 20, 20), 1);
+
+        // Interior is the translucent fill.
+        assert_eq!(pixels[20 * 40 + 20], HIGHLIGHT_FILL_PIXEL);
+        // The top-left corner of the rect is on the solid border.
+        assert_eq!(pixels[10 * 40 + 10], HIGHLIGHT_BORDER_PIXEL);
+        // Outside the rect stays untouched.
+        assert_eq!(pixels[5 * 40 + 5], CLEAR_PIXEL);
+    }
+
+    #[test]
+    fn window_highlight_clips_to_buffer_bounds() {
+        // A window extending past the top/left of the output (negative origin)
+        // and beyond the right/bottom is clipped without panicking.
+        let mut pixels = vec![CLEAR_PIXEL; 20 * 20];
+
+        draw_window_highlight(&mut pixels, 20, 20, (-10, -10, 40, 40), 1);
+
+        // The visible portion is filled (border within the first rows/cols).
+        assert_eq!(pixels[0], HIGHLIGHT_BORDER_PIXEL);
+        assert_eq!(pixels[10 * 20 + 10], HIGHLIGHT_FILL_PIXEL);
     }
 
     #[test]
