@@ -1,6 +1,6 @@
 [package]
 name = "crabture"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2024"
 description = "Standalone Linux screenshot tool — no external dependencies required. Supports X11 and Wayland."
 license = "GPL-3.0-only"
@@ -9,7 +9,7 @@ repository = "https://github.com/piny4man/crabture"
 homepage = "https://github.com/piny4man/crabture"
 keywords = ["screenshot", "wayland", "x11", "linux", "clipboard"]
 categories = ["command-line-utilities"]
-include = ["src/**", "Cargo.toml", "README.md", "LICENSE"]
+include = ["src/**", "assets/**", "Cargo.toml", "README.md", "LICENSE"]
 
 [profile.release]
 lto = "thin"
@@ -20,6 +20,7 @@ panic = "abort"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+serde_json = "1"
 time = { version = "0.3", features = ["macros", "local-offset"] }
 xcap = "0.8"
 image = "0.25"
@@ -35,3 +36,10 @@ wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 # Direct wlroots screencopy for full physical-resolution capture (bypasses
 # the XDG portal path in xcap which crops to logical resolution).
 libwayshot-xcap = "0.3"
+
+# Pure-Rust 2D rendering for the macOS-style toolbar: anti-aliased shapes
+# (tiny-skia), SVG icon rasterization (resvg/usvg), and text (ab_glyph).
+tiny-skia = "0.12"
+resvg = { version = "0.47", default-features = false }
+usvg = "0.47"
+ab_glyph = "0.2"

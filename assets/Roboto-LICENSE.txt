@@ -1,0 +1,3 @@
+Roboto-Medium.ttf is licensed under the Apache License, Version 2.0.
+Copyright the Roboto Project Authors (https://github.com/googlefonts/roboto).
+See https://www.apache.org/licenses/LICENSE-2.0
