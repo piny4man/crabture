@@ -127,6 +127,16 @@ struct LogicalOutput {
     height: u32,
 }
 
+/// A frozen, physical-resolution screenshot of a single output, tagged with the
+/// output's logical region so logical selections can be mapped to physical
+/// crops.  Captured once before the overlay is shown so the overlay can never
+/// appear in the result.
+#[derive(Clone, Debug)]
+struct OutputSnapshot {
+    logical: LogicalOutput,
+    image: image::RgbaImage,
+}
+
 const CLIPBOARD_IMAGE_MAGIC: &[u8; 8] = b"CBTRGBA1";
 const CLIPBOARD_IMAGE_HEADER_LEN: usize = 16;
 
@@ -246,6 +256,13 @@ fn cli_intent(cli: &Cli) -> CliIntent {
 fn run_graphical_screenshot_ui() -> Result<()> {
     let preferences = load_graphical_preferences().unwrap_or_default();
     let mut session = CaptureSession::with_preferences(preferences);
+
+    // Freeze every output at physical resolution *before* showing the overlay.
+    // This guarantees the toolbar can never appear in a capture (the leak fix),
+    // and lets window/area captures crop from a physical-resolution source
+    // instead of re-capturing at logical resolution.
+    let snapshots = capture_all_outputs()?;
+
     let command =
         overlay::run_screenshot_hud(session.preferences()).context("graphical UI failed")?;
 
@@ -254,19 +271,17 @@ fn run_graphical_screenshot_ui() -> Result<()> {
         SessionOutcome::Cancelled => Ok(()),
         SessionOutcome::CaptureArea(selection, preferences) => {
             save_graphical_preferences(&preferences).ok();
-            let all_screenshots = capture_all_outputs()?;
-            let img = selected_area_image(&all_screenshots, &selection)?;
+            let img = selected_area_image(&snapshots, &selection)?;
             save_graphical_capture(&img, preferences)
         }
         SessionOutcome::CaptureWindow(selection, preferences) => {
             save_graphical_preferences(&preferences).ok();
-            let img = selected_window_image(&selection)?;
+            let img = selected_window_image(&snapshots, &selection)?;
             save_graphical_capture(&img, preferences)
         }
         SessionOutcome::CaptureFullScreen(selection, preferences) => {
             save_graphical_preferences(&preferences).ok();
-            let all_screenshots = capture_all_outputs()?;
-            let img = selected_full_screen_image(&all_screenshots, &selection)?;
+            let img = selected_full_screen_image(&snapshots, &selection)?;
             save_graphical_capture(img, preferences)
         }
         SessionOutcome::Unsupported(message) => bail!(message),
@@ -475,18 +490,31 @@ fn capture_fullscreen() -> Result<image::RgbaImage> {
     monitor.capture_image().context("failed to capture screen")
 }
 
-/// Capture every monitor individually, returning `(output_name, image)` pairs.
-/// Each screenshot is at the monitor's native physical resolution.
-fn capture_all_outputs() -> Result<Vec<(String, image::RgbaImage)>> {
+/// Capture every monitor individually, returning a snapshot per output tagged
+/// with its logical region.  Each screenshot is at the monitor's native
+/// physical resolution.
+fn capture_all_outputs() -> Result<Vec<OutputSnapshot>> {
     // Try wlroots screencopy first — accurate physical resolution per output.
     if let Ok(conn) = libwayshot_xcap::WayshotConnection::new() {
         let outputs = conn.get_all_outputs();
         let shots: Vec<_> = outputs
             .iter()
             .filter_map(|output| {
-                conn.screenshot_single_output(output, false)
-                    .ok()
-                    .map(|img| (output.name.clone(), img.into_rgba8()))
+                let image = conn
+                    .screenshot_single_output(output, false)
+                    .ok()?
+                    .into_rgba8();
+                let region = output.logical_region.inner;
+                Some(OutputSnapshot {
+                    logical: LogicalOutput {
+                        name: output.name.clone(),
+                        x: region.position.x,
+                        y: region.position.y,
+                        width: region.size.width,
+                        height: region.size.height,
+                    },
+                    image,
+                })
             })
             .collect();
         if !shots.is_empty() {
@@ -494,13 +522,24 @@ fn capture_all_outputs() -> Result<Vec<(String, image::RgbaImage)>> {
         }
     }
 
-    // Fall back to xcap.
+    // Fall back to xcap.  On X11 the captured image is at logical resolution, so
+    // recording the image dimensions as the logical size keeps window/area crop
+    // math identity-scaled.
     let monitors = Monitor::all().context("failed to enumerate monitors")?;
     let mut shots = Vec::with_capacity(monitors.len());
     for m in &monitors {
         let name = m.name().unwrap_or_else(|_| "unknown".into());
-        let img = m.capture_image().context("failed to capture monitor")?;
-        shots.push((name, img));
+        let image = m.capture_image().context("failed to capture monitor")?;
+        shots.push(OutputSnapshot {
+            logical: LogicalOutput {
+                name,
+                x: m.x().unwrap_or(0),
+                y: m.y().unwrap_or(0),
+                width: image.width(),
+                height: image.height(),
+            },
+            image,
+        });
     }
     if shots.is_empty() {
         bail!("no monitors found");
@@ -532,23 +571,26 @@ fn select_area() -> Result<image::RgbaImage> {
 }
 
 fn selected_area_image(
-    all_screenshots: &[(String, image::RgbaImage)],
+    snapshots: &[OutputSnapshot],
     selection: &AreaSelection,
 ) -> Result<image::RgbaImage> {
     let (sx, sy, sw, sh) = selection.rect;
     if sw < 2 || sh < 2 {
         bail!("selection too small");
     }
+    if snapshots.is_empty() {
+        bail!("no monitors found");
+    }
 
-    // Pick the screenshot that matches the output the overlay was on.
-    // Fall back to the first screenshot if no match (shouldn't happen).
+    // Pick the snapshot that matches the output the overlay was on.
+    // Fall back to the first snapshot if no match (shouldn't happen).
     let screenshot = if let Some(ref target) = selection.output_name {
-        all_screenshots
+        snapshots
             .iter()
-            .find(|(name, _)| name == target)
-            .map_or(&all_screenshots[0].1, |(_, img)| img)
+            .find(|snap| snap.logical.name == *target)
+            .map_or(&snapshots[0].image, |snap| &snap.image)
     } else {
-        &all_screenshots[0].1
+        &snapshots[0].image
     };
 
     let crop = map_selection_to_physical_crop(
@@ -561,26 +603,31 @@ fn selected_area_image(
 }
 
 fn selected_full_screen_image<'a>(
-    all_screenshots: &'a [(String, image::RgbaImage)],
+    snapshots: &'a [OutputSnapshot],
     selection: &FullScreenSelection,
 ) -> Result<&'a image::RgbaImage> {
-    if all_screenshots.is_empty() {
+    if snapshots.is_empty() {
         bail!("no monitors found");
     }
 
     if let Some(ref target) = selection.output_name
-        && let Some((_, img)) = all_screenshots.iter().find(|(name, _)| name == target)
+        && let Some(snap) = snapshots.iter().find(|snap| snap.logical.name == *target)
     {
-        return Ok(img);
+        return Ok(&snap.image);
     }
 
-    Ok(&all_screenshots[0].1)
+    Ok(&snapshots[0].image)
 }
 
-fn selected_window_image(selection: &WindowSelection) -> Result<image::RgbaImage> {
+fn selected_window_image(
+    snapshots: &[OutputSnapshot],
+    selection: &WindowSelection,
+) -> Result<image::RgbaImage> {
     let hyprland_target_points = wayland_window_target_points(selection);
 
-    if let Some(img) = selected_hyprland_window_image(selection, &hyprland_target_points)? {
+    if let Some(img) =
+        selected_hyprland_window_image(snapshots, selection, &hyprland_target_points)?
+    {
         return Ok(img);
     }
 
@@ -605,14 +652,16 @@ fn selected_window_image(selection: &WindowSelection) -> Result<image::RgbaImage
         ));
     }
 
-    if let Some((_, window)) = target_points.iter().find_map(|point| {
+    if let Some((candidate, window)) = target_points.iter().find_map(|point| {
         candidates
             .iter()
             .find(|(candidate, _)| window_candidate_contains_point(candidate, *point))
     }) {
         let label = window_label(window.app_name().ok(), window.title().ok());
-        return window
-            .capture_image()
+        // Crop the window out of the frozen physical-resolution snapshot rather
+        // than re-capturing through xcap (which yields a logical-resolution,
+        // half-size image on Wayland and could include the torn-down overlay).
+        return crop_window_from_snapshots(snapshots, candidate)
             .with_context(|| format!("failed to capture selected window{label}"));
     }
 
@@ -620,6 +669,7 @@ fn selected_window_image(selection: &WindowSelection) -> Result<image::RgbaImage
 }
 
 fn selected_hyprland_window_image(
+    snapshots: &[OutputSnapshot],
     selection: &WindowSelection,
     target_points: &[(i32, i32)],
 ) -> Result<Option<image::RgbaImage>> {
@@ -628,44 +678,41 @@ fn selected_hyprland_window_image(
         return Ok(None);
     };
 
-    let Ok(conn) = libwayshot_xcap::WayshotConnection::new() else {
-        return Ok(None);
-    };
-    let outputs = conn.get_all_outputs();
-    let logical_outputs = outputs
-        .iter()
-        .map(|output| {
-            let region = output.logical_region.inner;
-            LogicalOutput {
-                name: output.name.clone(),
-                x: region.position.x,
-                y: region.position.y,
-                width: region.size.width,
-                height: region.size.height,
-            }
-        })
-        .collect::<Vec<_>>();
     let capture_rect = expand_logical_rect(
         (client.x, client.y, client.width, client.height),
         hyprland_border_size().unwrap_or(0),
     );
-    let Some(output) = output_for_logical_rect(&logical_outputs, capture_rect) else {
-        return Ok(None);
-    };
-    let Some(capture_rect) = clamp_logical_rect_to_output(capture_rect, output) else {
-        return Ok(None);
-    };
 
-    let Some(wayland_output) = outputs
+    Ok(crop_logical_rect_from_snapshots(snapshots, capture_rect))
+}
+
+/// Crop a window (given by its logical bounds) out of the frozen snapshots,
+/// erroring if the window is not within any captured display.
+fn crop_window_from_snapshots(
+    snapshots: &[OutputSnapshot],
+    candidate: &WindowCandidate,
+) -> Result<image::RgbaImage> {
+    let rect = (candidate.x, candidate.y, candidate.width, candidate.height);
+    crop_logical_rect_from_snapshots(snapshots, rect)
+        .context("selected window is not within a captured display")
+}
+
+/// Map a logical rectangle to the snapshot that contains it and crop the
+/// matching physical-resolution region.  Returns `None` when no snapshot
+/// overlaps the rectangle.
+fn crop_logical_rect_from_snapshots(
+    snapshots: &[OutputSnapshot],
+    rect: (i32, i32, u32, u32),
+) -> Option<image::RgbaImage> {
+    let logical_outputs = snapshots
         .iter()
-        .find(|wayland_output| wayland_output.name.as_str() == output.name.as_str())
-    else {
-        return Ok(None);
-    };
-    let Ok(screenshot) = conn.screenshot_single_output(wayland_output, false) else {
-        return Ok(None);
-    };
-    let screenshot = screenshot.into_rgba8();
+        .map(|snap| snap.logical.clone())
+        .collect::<Vec<_>>();
+    let output = output_for_logical_rect(&logical_outputs, rect)?;
+    let capture_rect = clamp_logical_rect_to_output(rect, output)?;
+    let snapshot = snapshots
+        .iter()
+        .find(|snap| snap.logical.name == output.name)?;
 
     let relative_rect = (
         (capture_rect.0 - output.x).max(0) as u32,
@@ -676,12 +723,10 @@ fn selected_hyprland_window_image(
     let crop = map_selection_to_physical_crop(
         relative_rect,
         (output.width, output.height),
-        (screenshot.width(), screenshot.height()),
+        (snapshot.image.width(), snapshot.image.height()),
     );
 
-    Ok(Some(
-        image::imageops::crop_imm(&screenshot, crop.x, crop.y, crop.w, crop.h).to_image(),
-    ))
+    Some(image::imageops::crop_imm(&snapshot.image, crop.x, crop.y, crop.w, crop.h).to_image())
 }
 
 fn hyprland_border_size() -> Option<u32> {
@@ -1245,13 +1290,29 @@ fn save_to_file(img: &image::RgbaImage, shot_dir: &Path, format: &str) -> Result
     let path = shot_dir.join(&name);
 
     if format.eq_ignore_ascii_case("jpg") || format.eq_ignore_ascii_case("jpeg") {
-        let rgb = image::DynamicImage::ImageRgba8(img.clone()).to_rgb8();
-        rgb.save(&path).context("failed to save screenshot")?;
+        let file = fs::File::create(&path).context("failed to save screenshot")?;
+        write_jpeg(std::io::BufWriter::new(file), img)?;
     } else {
         img.save(&path).context("failed to save screenshot")?;
     }
 
     Ok(path)
+}
+
+/// Encode an RGBA image as a high-quality JPEG (quality 92).  The `image`
+/// crate's default `save()` path encodes at quality 75, which is visibly soft;
+/// 92 keeps screenshots crisp while staying well within JPEG's size budget.
+fn write_jpeg<W: std::io::Write>(writer: W, img: &image::RgbaImage) -> Result<()> {
+    let rgb = image::DynamicImage::ImageRgba8(img.clone()).to_rgb8();
+    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(writer, 92);
+    image::ImageEncoder::write_image(
+        encoder,
+        rgb.as_raw(),
+        rgb.width(),
+        rgb.height(),
+        image::ExtendedColorType::Rgb8,
+    )
+    .context("failed to encode screenshot as JPEG")
 }
 
 fn countdown(mut secs: u64) {
@@ -1325,6 +1386,22 @@ mod tests {
     use crate::session::SessionCommand;
     use clap::CommandFactory;
 
+    /// Build an `OutputSnapshot` from a logical origin and a physical image.
+    /// The logical size defaults to the image dimensions (1× scale) so callers
+    /// that don't care about HiDPI scaling stay terse.
+    fn snapshot(name: &str, x: i32, y: i32, image: image::RgbaImage) -> OutputSnapshot {
+        OutputSnapshot {
+            logical: LogicalOutput {
+                name: name.to_string(),
+                x,
+                y,
+                width: image.width(),
+                height: image.height(),
+            },
+            image,
+        }
+    }
+
     #[test]
     fn no_arguments_launch_graphical_default() {
         let cli = Cli::try_parse_from(["crabture"]).expect("valid cli");
@@ -1378,8 +1455,8 @@ mod tests {
         let first = image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 0, 0, 255]));
         let second = image::RgbaImage::from_pixel(3, 3, image::Rgba([2, 0, 0, 255]));
         let screenshots = vec![
-            ("HDMI-A-1".to_string(), first),
-            ("eDP-1".to_string(), second),
+            snapshot("HDMI-A-1", 0, 0, first),
+            snapshot("eDP-1", 1920, 0, second),
         ];
 
         let selected = selected_full_screen_image(
@@ -1398,8 +1475,8 @@ mod tests {
         let first = image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 0, 0, 255]));
         let second = image::RgbaImage::from_pixel(3, 3, image::Rgba([2, 0, 0, 255]));
         let screenshots = vec![
-            ("HDMI-A-1".to_string(), first),
-            ("eDP-1".to_string(), second),
+            snapshot("HDMI-A-1", 0, 0, first),
+            snapshot("eDP-1", 1920, 0, second),
         ];
 
         let selected = selected_full_screen_image(
@@ -1411,6 +1488,94 @@ mod tests {
         .expect("falls back to first output");
 
         assert_eq!(selected.dimensions(), (2, 2));
+    }
+
+    #[test]
+    fn window_crop_selects_output_by_logical_containment() {
+        // Two side-by-side 1× outputs.
+        let left = image::RgbaImage::from_pixel(100, 100, image::Rgba([1, 0, 0, 255]));
+        let right = image::RgbaImage::from_pixel(100, 100, image::Rgba([2, 0, 0, 255]));
+        let snapshots = vec![
+            snapshot("HDMI-A-1", 0, 0, left),
+            snapshot("eDP-1", 100, 0, right),
+        ];
+
+        // Window fully inside the right output at logical (110, 20) size 30×40.
+        let cropped = crop_logical_rect_from_snapshots(&snapshots, (110, 20, 30, 40))
+            .expect("window overlaps a captured output");
+
+        assert_eq!(cropped.dimensions(), (30, 40));
+        // It cropped from the right output (red channel 2), not the left.
+        assert_eq!(cropped.get_pixel(0, 0).0[0], 2);
+    }
+
+    #[test]
+    fn window_crop_maps_logical_rect_to_physical_on_hidpi() {
+        // A single 2× output: 100×100 logical, 200×200 physical.
+        let physical = image::RgbaImage::from_pixel(200, 200, image::Rgba([3, 0, 0, 255]));
+        let snapshots = vec![OutputSnapshot {
+            logical: LogicalOutput {
+                name: "eDP-1".to_string(),
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+            image: physical,
+        }];
+
+        // Logical window (10, 10) size 20×20 → physical (20, 20) size 40×40.
+        let cropped = crop_logical_rect_from_snapshots(&snapshots, (10, 10, 20, 20))
+            .expect("window overlaps the output");
+
+        assert_eq!(cropped.dimensions(), (40, 40));
+    }
+
+    #[test]
+    fn window_crop_returns_none_when_outside_all_outputs() {
+        let only = image::RgbaImage::from_pixel(100, 100, image::Rgba([1, 0, 0, 255]));
+        let snapshots = vec![snapshot("eDP-1", 0, 0, only)];
+
+        // Window far off to the right of the only output.
+        assert!(crop_logical_rect_from_snapshots(&snapshots, (500, 500, 20, 20)).is_none());
+    }
+
+    #[test]
+    fn jpeg_encoder_uses_high_quality() {
+        // High-frequency content so quality differences are pronounced.
+        let img = image::RgbaImage::from_fn(64, 64, |x, y| {
+            let v = ((x * 7 + y * 13) % 256) as u8;
+            image::Rgba([v, v.wrapping_mul(3), v.wrapping_add(90), 255])
+        });
+
+        let mut high = Vec::new();
+        write_jpeg(&mut high, &img).expect("encodes jpeg");
+
+        // Compare against the image crate's default-quality (75) encoder.
+        let rgb = image::DynamicImage::ImageRgba8(img.clone()).to_rgb8();
+        let mut default = Vec::new();
+        let encoder = image::codecs::jpeg::JpegEncoder::new(&mut default);
+        image::ImageEncoder::write_image(
+            encoder,
+            rgb.as_raw(),
+            rgb.width(),
+            rgb.height(),
+            image::ExtendedColorType::Rgb8,
+        )
+        .expect("encodes default jpeg");
+
+        // Valid JPEG magic bytes.
+        assert_eq!(&high[..2], &[0xFF, 0xD8]);
+        // Quality 92 retains more detail, so the file is larger than quality 75.
+        assert!(
+            high.len() > default.len(),
+            "quality 92 ({}) should be larger than default 75 ({})",
+            high.len(),
+            default.len()
+        );
+        // And it round-trips back to the original dimensions.
+        let decoded = image::load_from_memory(&high).expect("decodes jpeg");
+        assert_eq!((decoded.width(), decoded.height()), (64, 64));
     }
 
     #[test]
