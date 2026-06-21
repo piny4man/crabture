@@ -16,6 +16,7 @@ use time::OffsetDateTime;
 use xcap::{Monitor, Window};
 
 mod overlay;
+mod render;
 mod session;
 
 use session::{

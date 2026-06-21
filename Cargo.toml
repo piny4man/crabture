@@ -9,7 +9,7 @@ repository = "https://github.com/piny4man/crabture"
 homepage = "https://github.com/piny4man/crabture"
 keywords = ["screenshot", "wayland", "x11", "linux", "clipboard"]
 categories = ["command-line-utilities"]
-include = ["src/**", "Cargo.toml", "README.md", "LICENSE"]
+include = ["src/**", "assets/**", "Cargo.toml", "README.md", "LICENSE"]
 
 [profile.release]
 lto = "thin"
@@ -36,3 +36,10 @@ wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 # Direct wlroots screencopy for full physical-resolution capture (bypasses
 # the XDG portal path in xcap which crops to logical resolution).
 libwayshot-xcap = "0.3"
+
+# Pure-Rust 2D rendering for the macOS-style toolbar: anti-aliased shapes
+# (tiny-skia), SVG icon rasterization (resvg/usvg), and text (ab_glyph).
+tiny-skia = "0.12"
+resvg = { version = "0.47", default-features = false }
+usvg = "0.47"
+ab_glyph = "0.2"

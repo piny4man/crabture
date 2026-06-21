@@ -6,9 +6,10 @@
 //! border so the user can see the content underneath.
 //! Pointer click-drag selects the area; Escape or right-click cancels.
 
+use crate::render;
 use crate::session::{
-    AreaSelection, CaptureMode, FullScreenSelection, GraphicalPreferences, OutputDestination,
-    SaveLocationChoice, SessionCommand, WindowSelection,
+    AreaSelection, CaptureMode, FullScreenSelection, GraphicalPreferences, SessionCommand,
+    WindowSelection,
 };
 use anyhow::{Context, Result};
 use smithay_client_toolkit::{
@@ -50,9 +51,6 @@ const OVERLAY_PIXEL: u32 = 0x9900_0000;
 const CLEAR_PIXEL: u32 = 0x0000_0000;
 /// Border: solid white, premultiplied.
 const BORDER_PIXEL: u32 = 0xFFFF_FFFF;
-const HUD_PIXEL: u32 = 0xDD22_2222;
-const HUD_ACTIVE_PIXEL: u32 = 0xDD44_6688;
-const HUD_TEXT_PIXEL: u32 = 0xFFFF_FFFF;
 
 /// A rectangle in logical surface coordinates: (x, y, width, height).
 pub type SelectionRect = (u32, u32, u32, u32);
@@ -361,6 +359,7 @@ pub fn run_selection_overlay() -> Result<OverlayResult> {
         selection: None,
         area_drag: None,
         window_target: None,
+        hovered_button: None,
 
         output_name: None,
 
@@ -441,6 +440,7 @@ pub fn run_screenshot_hud(default_preferences: GraphicalPreferences) -> Result<S
         selection: None,
         area_drag: None,
         window_target: None,
+        hovered_button: None,
 
         output_name: None,
 
@@ -513,6 +513,8 @@ struct OverlayState {
     selection: Option<(u32, u32, u32, u32)>,
     area_drag: Option<AreaDrag>,
     window_target: Option<(u32, u32)>,
+    /// Index of the toolbar button under the pointer, for hover styling.
+    hovered_button: Option<usize>,
 
     /// Name of the output the overlay surface is on (e.g. "eDP-1", "HDMI-A-1").
     output_name: Option<String>,
@@ -587,6 +589,23 @@ impl OverlayState {
             (self.surface_w, self.surface_h),
             self.output_name.clone(),
         )
+    }
+
+    /// Recompute which toolbar button is under the pointer.  Returns `true`
+    /// when the hovered button changed so the caller can trigger a redraw.
+    fn update_hover(&mut self, lx: f64, ly: f64) -> bool {
+        let layout = render::toolbar_layout(
+            self.surface_w as usize,
+            self.surface_h as usize,
+            self.preferences,
+        );
+        let hovered = render::button_at(&layout, lx, ly);
+        if hovered != self.hovered_button {
+            self.hovered_button = hovered;
+            true
+        } else {
+            false
+        }
     }
 
     fn draw(&mut self, qh: &QueueHandle<Self>) {
@@ -687,30 +706,16 @@ impl OverlayState {
         } else {
             pixels.fill(CLEAR_PIXEL);
         }
-        for button in hud_buttons(lw, lh, self.preferences) {
-            let fill = if button.mode == Some(self.preferences.mode) {
-                HUD_ACTIVE_PIXEL
-            } else {
-                HUD_PIXEL
-            };
-            fill_rect(
-                pixels,
-                pw,
-                button.x * scale,
-                button.y * scale,
-                button.width * scale,
-                button.height * scale,
-                fill,
-            );
-            draw_text(
-                pixels,
-                pw,
-                (button.x + 14) * scale,
-                (button.y + 17) * scale,
-                &button.label,
-                HUD_TEXT_PIXEL,
-                scale,
-            );
+
+        // Render the macOS-style toolbar into a small anti-aliased pixmap and
+        // composite it over the canvas.  Layout is in logical coordinates so it
+        // stays in sync with the pointer hit-test; the renderer scales it to the
+        // physical buffer resolution.
+        let layout = render::toolbar_layout(lw, lh, self.preferences);
+        if let Some((toolbar, ox, oy)) =
+            render::render_toolbar(&layout, self.preferences, scale, self.hovered_button)
+        {
+            render::blit_argb(pixels, pw, ph, &toolbar, ox, oy);
         }
     }
 }
@@ -788,184 +793,6 @@ fn draw_selection(
                 pixels[row * w + x1] = BORDER_PIXEL;
                 if x2 > x1 + 1 {
                     pixels[row * w + x2 - 1] = BORDER_PIXEL;
-                }
-            }
-        }
-    }
-}
-
-struct HudButton {
-    label: String,
-    x: usize,
-    y: usize,
-    width: usize,
-    height: usize,
-    command: SessionCommand,
-    mode: Option<CaptureMode>,
-}
-
-fn hud_buttons(w: usize, h: usize, preferences: GraphicalPreferences) -> Vec<HudButton> {
-    let widths = [72, 96, 72, 96, 118, 80, 112, 96];
-    let gap = 8;
-    let total: usize = widths.iter().sum::<usize>() + gap * (widths.len() - 1);
-    let x = w.saturating_sub(total) / 2;
-    let y = h.saturating_sub(76);
-    let mut next_x = x;
-    let mut button =
-        |label: String, width: usize, command: SessionCommand, mode: Option<CaptureMode>| {
-            let current_x = next_x;
-            next_x += width + gap;
-            HudButton {
-                label,
-                x: current_x,
-                y,
-                width,
-                height: 44,
-                command,
-                mode,
-            }
-        };
-
-    vec![
-        button(
-            "AREA".to_string(),
-            widths[0],
-            SessionCommand::SetMode(CaptureMode::Area),
-            Some(CaptureMode::Area),
-        ),
-        button(
-            "WINDOW".to_string(),
-            widths[1],
-            SessionCommand::SetMode(CaptureMode::Window),
-            Some(CaptureMode::Window),
-        ),
-        button(
-            "FULL".to_string(),
-            widths[2],
-            SessionCommand::SetMode(CaptureMode::FullScreen),
-            Some(CaptureMode::FullScreen),
-        ),
-        button(
-            output_label(preferences.output),
-            widths[3],
-            SessionCommand::SetOutput(preferences.output.next()),
-            None,
-        ),
-        button(
-            location_label(preferences.location),
-            widths[4],
-            SessionCommand::SetLocation(preferences.location.next()),
-            None,
-        ),
-        button(
-            preferences.format.as_str().to_ascii_uppercase(),
-            widths[5],
-            SessionCommand::SetFormat(preferences.format.next()),
-            None,
-        ),
-        button(
-            "CAPTURE".to_string(),
-            widths[6],
-            SessionCommand::Capture,
-            None,
-        ),
-        button(
-            "CANCEL".to_string(),
-            widths[7],
-            SessionCommand::Cancel,
-            None,
-        ),
-    ]
-}
-
-fn output_label(output: OutputDestination) -> String {
-    match output {
-        OutputDestination::Clipboard => "COPY".to_string(),
-        OutputDestination::Save => "SAVE".to_string(),
-        OutputDestination::CopyAndSave => "COPY+SAVE".to_string(),
-    }
-}
-
-fn location_label(location: SaveLocationChoice) -> String {
-    match location {
-        SaveLocationChoice::Screenshots => "SCREENSHOTS".to_string(),
-        SaveLocationChoice::CurrentDirectory => "CURRENT DIR".to_string(),
-    }
-}
-
-fn fill_rect(
-    pixels: &mut [u32],
-    surface_w: usize,
-    x: usize,
-    y: usize,
-    width: usize,
-    height: usize,
-    pixel: u32,
-) {
-    for row in y..(y + height) {
-        let start = row * surface_w + x;
-        let end = start + width;
-        pixels[start..end].fill(pixel);
-    }
-}
-
-fn draw_text(
-    pixels: &mut [u32],
-    surface_w: usize,
-    x: usize,
-    y: usize,
-    text: &str,
-    pixel: u32,
-    scale: usize,
-) {
-    let mut cursor = x;
-    for ch in text.chars() {
-        draw_char(pixels, surface_w, cursor, y, ch, pixel, scale);
-        cursor += 7 * scale;
-    }
-}
-
-fn draw_char(
-    pixels: &mut [u32],
-    surface_w: usize,
-    x: usize,
-    y: usize,
-    ch: char,
-    pixel: u32,
-    scale: usize,
-) {
-    let glyph = match ch {
-        'A' => [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
-        'C' => [0x0F, 0x10, 0x10, 0x10, 0x10, 0x10, 0x0F],
-        'D' => [0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E],
-        'E' => [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F],
-        'F' => [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10],
-        'I' => [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x1F],
-        'L' => [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F],
-        'N' => [0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11],
-        'O' => [0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
-        'P' => [0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10],
-        'R' => [0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11],
-        'T' => [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
-        'U' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
-        'W' => [0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11],
-        _ => [0, 0, 0, 0, 0, 0, 0],
-    };
-
-    for (row_idx, row) in glyph.iter().enumerate() {
-        for col in 0..5 {
-            if row & (1 << (4 - col)) != 0 {
-                // Render each font pixel as a scale×scale block so the bitmap
-                // font stays proportionate on HiDPI buffers.
-                for dy in 0..scale {
-                    for dx in 0..scale {
-                        let px = x + col * scale + dx;
-                        let py = y + row_idx * scale + dy;
-                        let idx = py * surface_w + px;
-                        if idx < pixels.len() {
-                            pixels[idx] = pixel;
-                        }
-                    }
                 }
             }
         }
@@ -1300,21 +1127,15 @@ impl PointerHandler for OverlayState {
                     if self.hud_active {
                         let mode = self.preferences.mode;
                         if button == 0x110 {
-                            let x = lx.round() as usize;
-                            let y = ly.round() as usize;
-                            for hud_button in hud_buttons(
+                            let mut layout = render::toolbar_layout(
                                 self.surface_w as usize,
                                 self.surface_h as usize,
                                 self.preferences,
-                            ) {
-                                let inside_x =
-                                    x >= hud_button.x && x < hud_button.x + hud_button.width;
-                                let inside_y =
-                                    y >= hud_button.y && y < hud_button.y + hud_button.height;
-                                if inside_x && inside_y {
-                                    self.apply_hud_command(hud_button.command, qh);
-                                    return;
-                                }
+                            );
+                            if let Some(idx) = render::button_at(&layout, lx, ly) {
+                                let command = layout.swap_remove(idx).command;
+                                self.apply_hud_command(command, qh);
+                                return;
                             }
                             if mode == CaptureMode::Area {
                                 let point = (lx.round() as i32, ly.round() as i32);
@@ -1433,11 +1254,14 @@ impl PointerHandler for OverlayState {
                     }
                     needs_redraw = true;
                 }
-                PointerEventKind::Motion { .. }
-                    if self.hud_active && self.preferences.mode == CaptureMode::Window =>
-                {
-                    self.window_target = Some((lx.round() as u32, ly.round() as u32));
-                    needs_redraw = true;
+                PointerEventKind::Motion { .. } if self.hud_active => {
+                    if self.preferences.mode == CaptureMode::Window {
+                        self.window_target = Some((lx.round() as u32, ly.round() as u32));
+                        needs_redraw = true;
+                    }
+                    if self.update_hover(lx, ly) {
+                        needs_redraw = true;
+                    }
                 }
                 _ => {}
             }
@@ -1482,6 +1306,7 @@ impl ProvidesRegistryState for OverlayState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::{OutputDestination, SaveLocationChoice};
 
     #[test]
     fn normalizes_selection_drag_from_any_direction() {
