@@ -259,6 +259,52 @@ fn mode_selection_command(
     }
 }
 
+fn confirmed_capture_command(
+    preferences: GraphicalPreferences,
+    selection: Option<SelectionRect>,
+    window_target: Option<(u32, u32)>,
+    surface_size: (u32, u32),
+    output_name: Option<String>,
+) -> SessionCommand {
+    match preferences.mode {
+        CaptureMode::Area => selection.map_or(SessionCommand::Capture, |rect| {
+            capture_area_command(rect, surface_size, output_name, preferences)
+        }),
+        CaptureMode::Window => window_target.map_or(SessionCommand::Capture, |point| {
+            capture_window_command(point, surface_size, output_name, preferences)
+        }),
+        CaptureMode::FullScreen => capture_full_screen_command(output_name, preferences),
+    }
+}
+
+fn shortcut_session_command(
+    keysym: Keysym,
+    output_name: Option<String>,
+    preferences: GraphicalPreferences,
+) -> Option<SessionCommand> {
+    match keysym {
+        Keysym::a | Keysym::A => Some(mode_selection_command(
+            CaptureMode::Area,
+            output_name,
+            preferences,
+        )),
+        Keysym::w | Keysym::W => Some(mode_selection_command(
+            CaptureMode::Window,
+            output_name,
+            preferences,
+        )),
+        Keysym::f | Keysym::F => Some(mode_selection_command(
+            CaptureMode::FullScreen,
+            output_name,
+            preferences,
+        )),
+        Keysym::o | Keysym::O => Some(SessionCommand::SetOutput(preferences.output.next())),
+        Keysym::l | Keysym::L => Some(SessionCommand::SetLocation(preferences.location.next())),
+        Keysym::p | Keysym::P => Some(SessionCommand::SetFormat(preferences.format.next())),
+        _ => None,
+    }
+}
+
 /// Run the fullscreen overlay and return `(selection, (surface_w, surface_h), output_name)`.
 /// `selection` is `Some((x, y, w, h))` in logical surface coordinates, or
 /// `None` if cancelled.  `output_name` identifies which monitor the overlay
@@ -478,32 +524,48 @@ impl OverlayState {
         }
     }
 
-    fn capture_or_error_command(&self) -> SessionCommand {
-        match self.preferences.mode {
-            CaptureMode::Area => {
-                if let Some(rect) = self.selection {
-                    capture_area_command(
-                        rect,
-                        (self.surface_w, self.surface_h),
-                        self.output_name.clone(),
-                        self.preferences,
-                    )
-                } else {
-                    SessionCommand::Capture
-                }
+    fn apply_hud_command(&mut self, command: SessionCommand, qh: &QueueHandle<Self>) {
+        match command {
+            SessionCommand::SetMode(mode) => {
+                self.activate_mode(mode, qh);
             }
-            CaptureMode::FullScreen => {
-                capture_full_screen_command(self.output_name.clone(), self.preferences)
+            SessionCommand::SetOutput(output) => {
+                self.preferences.output = output;
+                self.draw(qh);
             }
-            CaptureMode::Window => self.window_target.map_or(SessionCommand::Capture, |point| {
-                capture_window_command(
-                    point,
-                    (self.surface_w, self.surface_h),
-                    self.output_name.clone(),
-                    self.preferences,
-                )
-            }),
+            SessionCommand::SetFormat(format) => {
+                self.preferences.format = format;
+                self.draw(qh);
+            }
+            SessionCommand::SetLocation(location) => {
+                self.preferences.location = location;
+                self.draw(qh);
+            }
+            SessionCommand::Capture => {
+                self.hud_result = Some(self.capture_or_error_command());
+                self.exit = true;
+            }
+            SessionCommand::Cancel => {
+                self.cancelled = true;
+                self.exit = true;
+            }
+            SessionCommand::CaptureArea(_, _)
+            | SessionCommand::CaptureWindow(_, _)
+            | SessionCommand::CaptureFullScreen(_, _) => {
+                self.hud_result = Some(command);
+                self.exit = true;
+            }
         }
+    }
+
+    fn capture_or_error_command(&self) -> SessionCommand {
+        confirmed_capture_command(
+            self.preferences,
+            self.selection,
+            self.window_target,
+            (self.surface_w, self.surface_h),
+            self.output_name.clone(),
+        )
     }
 
     fn draw(&mut self, qh: &QueueHandle<Self>) {
@@ -1053,28 +1115,15 @@ impl KeyboardHandler for OverlayState {
                 self.area_drag = None;
                 self.draw(qh);
             }
-            Keysym::a | Keysym::A => {
-                self.activate_mode(CaptureMode::Area, qh);
+            _ => {
+                if let Some(command) = shortcut_session_command(
+                    event.keysym,
+                    self.output_name.clone(),
+                    self.preferences,
+                ) {
+                    self.apply_hud_command(command, qh);
+                }
             }
-            Keysym::w | Keysym::W => {
-                self.activate_mode(CaptureMode::Window, qh);
-            }
-            Keysym::f | Keysym::F => {
-                self.activate_mode(CaptureMode::FullScreen, qh);
-            }
-            Keysym::o | Keysym::O => {
-                self.preferences.output = self.preferences.output.next();
-                self.draw(qh);
-            }
-            Keysym::l | Keysym::L => {
-                self.preferences.location = self.preferences.location.next();
-                self.draw(qh);
-            }
-            Keysym::p | Keysym::P => {
-                self.preferences.format = self.preferences.format.next();
-                self.draw(qh);
-            }
-            _ => {}
         }
     }
 
@@ -1152,34 +1201,7 @@ impl PointerHandler for OverlayState {
                                 let inside_y =
                                     y >= hud_button.y && y < hud_button.y + hud_button.height;
                                 if inside_x && inside_y {
-                                    match hud_button.command {
-                                        SessionCommand::SetMode(mode) => {
-                                            self.activate_mode(mode, qh);
-                                        }
-                                        SessionCommand::SetOutput(output) => {
-                                            self.preferences.output = output;
-                                            self.draw(qh);
-                                        }
-                                        SessionCommand::SetFormat(format) => {
-                                            self.preferences.format = format;
-                                            self.draw(qh);
-                                        }
-                                        SessionCommand::SetLocation(location) => {
-                                            self.preferences.location = location;
-                                            self.draw(qh);
-                                        }
-                                        SessionCommand::Capture => {
-                                            self.hud_result = Some(self.capture_or_error_command());
-                                            self.exit = true;
-                                        }
-                                        SessionCommand::Cancel => {
-                                            self.cancelled = true;
-                                            self.exit = true;
-                                        }
-                                        SessionCommand::CaptureArea(_, _)
-                                        | SessionCommand::CaptureWindow(_, _)
-                                        | SessionCommand::CaptureFullScreen(_, _) => {}
-                                    }
+                                    self.apply_hud_command(hud_button.command, qh);
                                     return;
                                 }
                             }
@@ -1444,6 +1466,98 @@ mod tests {
         assert_eq!(
             mode_selection_command(CaptureMode::Window, Some("eDP-1".to_string()), preferences),
             SessionCommand::SetMode(CaptureMode::Window)
+        );
+    }
+
+    #[test]
+    fn keyboard_shortcuts_share_toolbar_commands() {
+        let preferences = GraphicalPreferences {
+            output: OutputDestination::Save,
+            format: crate::session::GraphicalFormat::Jpg,
+            location: SaveLocationChoice::CurrentDirectory,
+            mode: CaptureMode::Area,
+        };
+
+        assert_eq!(
+            shortcut_session_command(Keysym::a, Some("eDP-1".to_string()), preferences),
+            Some(SessionCommand::SetMode(CaptureMode::Area))
+        );
+        assert_eq!(
+            shortcut_session_command(Keysym::w, Some("eDP-1".to_string()), preferences),
+            Some(SessionCommand::SetMode(CaptureMode::Window))
+        );
+        assert_eq!(
+            shortcut_session_command(Keysym::f, Some("eDP-1".to_string()), preferences),
+            Some(SessionCommand::CaptureFullScreen(
+                FullScreenSelection {
+                    output_name: Some("eDP-1".to_string()),
+                },
+                GraphicalPreferences {
+                    mode: CaptureMode::FullScreen,
+                    ..preferences
+                },
+            ))
+        );
+        assert_eq!(
+            shortcut_session_command(Keysym::o, None, preferences),
+            Some(SessionCommand::SetOutput(OutputDestination::CopyAndSave))
+        );
+    }
+
+    #[test]
+    fn confirm_command_is_consistent_across_modes() {
+        let preferences = GraphicalPreferences::default();
+
+        assert_eq!(
+            confirmed_capture_command(
+                preferences,
+                Some((10, 20, 30, 40)),
+                None,
+                (800, 600),
+                Some("eDP-1".to_string())
+            ),
+            SessionCommand::CaptureArea(
+                AreaSelection {
+                    rect: (10, 20, 30, 40),
+                    surface_size: (800, 600),
+                    output_name: Some("eDP-1".to_string()),
+                },
+                preferences,
+            )
+        );
+
+        let preferences = GraphicalPreferences {
+            mode: CaptureMode::Window,
+            ..preferences
+        };
+        assert_eq!(
+            confirmed_capture_command(
+                preferences,
+                None,
+                Some((120, 80)),
+                (800, 600),
+                Some("eDP-1".to_string())
+            ),
+            SessionCommand::CaptureWindow(
+                WindowSelection {
+                    point: (120, 80),
+                    surface_size: (800, 600),
+                    output_name: Some("eDP-1".to_string()),
+                },
+                preferences,
+            )
+        );
+
+        let preferences = GraphicalPreferences {
+            mode: CaptureMode::FullScreen,
+            ..preferences
+        };
+        assert_eq!(
+            confirmed_capture_command(preferences, None, None, (800, 600), None),
+            SessionCommand::CaptureFullScreen(
+                FullScreenSelection { output_name: None },
+                preferences
+            )
         );
     }
 

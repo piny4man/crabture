@@ -25,7 +25,8 @@ use session::{
 #[derive(Parser, Debug)]
 #[command(
     version,
-    about = "Standalone screenshot tool — no external dependencies required"
+    about = "Standalone screenshot tool — no external dependencies required",
+    long_about = "Standalone screenshot tool — no external dependencies required\n\nRun without arguments to open the graphical screenshot UI. Explicit direct-capture commands such as --instant, --monitor, --select, and --region remain available for automation. Use --menu for the legacy terminal menu."
 )]
 struct Cli {
     /// Take immediate full-screen shot (no UI)
@@ -1290,6 +1291,18 @@ mod tests {
     }
 
     #[test]
+    fn cli_help_documents_graphical_default_and_direct_capture_commands() {
+        let help = Cli::command().render_long_help().to_string();
+
+        assert!(help.contains("Run without arguments to open the graphical screenshot UI"));
+        assert!(help.contains("--menu"));
+        assert!(help.contains("--instant"));
+        assert!(help.contains("--select"));
+        assert!(help.contains("--region"));
+        assert!(help.contains("--monitor"));
+    }
+
+    #[test]
     fn cancel_has_no_capture_side_effect_intent() {
         let mut session = CaptureSession::default();
 
@@ -1346,7 +1359,10 @@ mod tests {
 
         assert_eq!(
             session.handle(SessionCommand::Capture),
-            SessionOutcome::Unsupported("Click a window before capturing.".to_string())
+            SessionOutcome::Unsupported(
+                "Click a window before capturing, or switch to Area/Full Screen if window capture is unavailable."
+                    .to_string()
+            )
         );
     }
 

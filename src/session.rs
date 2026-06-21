@@ -234,18 +234,17 @@ impl CaptureSession {
                 SessionOutcome::Unsupported(self.unsupported_message())
             }
             SessionCommand::Cancel => SessionOutcome::Cancelled,
-            SessionCommand::Capture if self.preferences.mode == CaptureMode::Area => {
-                SessionOutcome::Unsupported("Draw an area before capturing.".to_string())
-            }
             SessionCommand::Capture => SessionOutcome::Unsupported(self.unsupported_message()),
         }
     }
 
     fn unsupported_message(&self) -> String {
         match self.preferences.mode {
-            CaptureMode::Area => "Area capture from the graphical toolbar is not implemented yet. Use --select for direct area capture.",
-            CaptureMode::Window => "Click a window before capturing.",
-            CaptureMode::FullScreen => "Full screen capture could not determine a target display.",
+            CaptureMode::Area => {
+                "Draw an area before capturing, or use --select for direct area capture."
+            }
+            CaptureMode::Window => "Click a window before capturing, or switch to Area/Full Screen if window capture is unavailable.",
+            CaptureMode::FullScreen => "Full screen capture could not determine a target display; try --list-monitors or --monitor <N>.",
         }
         .to_string()
     }
@@ -416,7 +415,10 @@ mod tests {
 
         assert_eq!(
             session.handle(SessionCommand::Capture),
-            SessionOutcome::Unsupported("Draw an area before capturing.".to_string())
+            SessionOutcome::Unsupported(
+                "Draw an area before capturing, or use --select for direct area capture."
+                    .to_string()
+            )
         );
     }
 
@@ -427,7 +429,59 @@ mod tests {
         session.handle(SessionCommand::SetMode(CaptureMode::Window));
         assert_eq!(
             session.handle(SessionCommand::Capture),
-            SessionOutcome::Unsupported("Click a window before capturing.".to_string())
+            SessionOutcome::Unsupported(
+                "Click a window before capturing, or switch to Area/Full Screen if window capture is unavailable."
+                    .to_string()
+            )
         );
+    }
+
+    #[test]
+    fn unsupported_feedback_is_actionable_for_every_mode() {
+        let cases = [
+            (
+                CaptureMode::Area,
+                "Draw an area before capturing, or use --select for direct area capture.",
+            ),
+            (
+                CaptureMode::Window,
+                "Click a window before capturing, or switch to Area/Full Screen if window capture is unavailable.",
+            ),
+            (
+                CaptureMode::FullScreen,
+                "Full screen capture could not determine a target display; try --list-monitors or --monitor <N>.",
+            ),
+        ];
+
+        for (mode, message) in cases {
+            let mut session = CaptureSession::with_preferences(GraphicalPreferences {
+                mode,
+                ..GraphicalPreferences::default()
+            });
+
+            assert_eq!(
+                session.handle(SessionCommand::Capture),
+                SessionOutcome::Unsupported(message.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn cancel_is_consistent_from_every_mode() {
+        for mode in [
+            CaptureMode::Area,
+            CaptureMode::Window,
+            CaptureMode::FullScreen,
+        ] {
+            let mut session = CaptureSession::with_preferences(GraphicalPreferences {
+                mode,
+                ..GraphicalPreferences::default()
+            });
+
+            assert_eq!(
+                session.handle(SessionCommand::Cancel),
+                SessionOutcome::Cancelled
+            );
+        }
     }
 }
