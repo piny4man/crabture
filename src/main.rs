@@ -7,7 +7,7 @@ use std::{
     borrow::Cow,
     env, fs,
     path::{Path, PathBuf},
-    process,
+    process::{self, Command},
     thread::sleep,
     time::Duration,
 };
@@ -115,6 +115,18 @@ struct WindowCandidate {
     height: u32,
     minimized: bool,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LogicalOutput {
+    name: String,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+const CLIPBOARD_IMAGE_MAGIC: &[u8; 8] = b"CBTRGBA1";
+const CLIPBOARD_IMAGE_HEADER_LEN: usize = 16;
 
 impl ClipboardDaemonCommand {
     fn args(&self) -> [&Path; 2] {
@@ -564,35 +576,308 @@ fn selected_full_screen_image<'a>(
 }
 
 fn selected_window_image(selection: &WindowSelection) -> Result<image::RgbaImage> {
-    let target = map_window_target_to_physical(selection)?;
+    let hyprland_target_points = wayland_window_target_points(selection);
+
+    if let Some(img) = selected_hyprland_window_image(selection, &hyprland_target_points)? {
+        return Ok(img);
+    }
+
+    let target_points = window_target_points(selection)?;
+
     let windows = Window::all().context(
         "true window capture is unavailable on this desktop; try Area or Full Screen capture",
     )?;
 
+    let mut candidates = Vec::with_capacity(windows.len());
     for window in windows {
-        let candidate = WindowCandidate {
-            id: window.id().unwrap_or_default(),
-            x: window.x().context("failed to read window position")?,
-            y: window.y().context("failed to read window position")?,
-            width: window.width().context("failed to read window size")?,
-            height: window.height().context("failed to read window size")?,
-            minimized: window.is_minimized().unwrap_or(false),
-        };
+        candidates.push((
+            WindowCandidate {
+                id: window.id().unwrap_or_default(),
+                x: window.x().context("failed to read window position")?,
+                y: window.y().context("failed to read window position")?,
+                width: window.width().context("failed to read window size")?,
+                height: window.height().context("failed to read window size")?,
+                minimized: window.is_minimized().unwrap_or(false),
+            },
+            window,
+        ));
+    }
 
-        if window_candidate_contains_point(&candidate, target) {
-            let label = window_label(window.app_name().ok(), window.title().ok());
-            return window
-                .capture_image()
-                .with_context(|| format!("failed to capture selected window{label}"));
-        }
+    if let Some((_, window)) = target_points.iter().find_map(|point| {
+        candidates
+            .iter()
+            .find(|(candidate, _)| window_candidate_contains_point(candidate, *point))
+    }) {
+        let label = window_label(window.app_name().ok(), window.title().ok());
+        return window
+            .capture_image()
+            .with_context(|| format!("failed to capture selected window{label}"));
     }
 
     bail!("no capturable window found at the selected point; try clicking inside the window")
 }
 
-fn map_window_target_to_physical(selection: &WindowSelection) -> Result<(i32, i32)> {
+fn selected_hyprland_window_image(
+    selection: &WindowSelection,
+    target_points: &[(i32, i32)],
+) -> Result<Option<image::RgbaImage>> {
+    let Some(client) = selected_hyprland_client(target_points, selection.output_name.as_deref())?
+    else {
+        return Ok(None);
+    };
+
+    let Ok(conn) = libwayshot_xcap::WayshotConnection::new() else {
+        return Ok(None);
+    };
+    let outputs = conn.get_all_outputs();
+    let logical_outputs = outputs
+        .iter()
+        .map(|output| {
+            let region = output.logical_region.inner;
+            LogicalOutput {
+                name: output.name.clone(),
+                x: region.position.x,
+                y: region.position.y,
+                width: region.size.width,
+                height: region.size.height,
+            }
+        })
+        .collect::<Vec<_>>();
+    let Some(output) = output_for_logical_rect(
+        &logical_outputs,
+        (client.x, client.y, client.width, client.height),
+    ) else {
+        return Ok(None);
+    };
+
+    let Some(wayland_output) = outputs
+        .iter()
+        .find(|wayland_output| wayland_output.name.as_str() == output.name.as_str())
+    else {
+        return Ok(None);
+    };
+    let Ok(screenshot) = conn.screenshot_single_output(wayland_output, false) else {
+        return Ok(None);
+    };
+    let screenshot = screenshot.into_rgba8();
+
+    let relative_rect = (
+        (client.x - output.x).max(0) as u32,
+        (client.y - output.y).max(0) as u32,
+        client.width,
+        client.height,
+    );
+    let crop = map_selection_to_physical_crop(
+        relative_rect,
+        (output.width, output.height),
+        (screenshot.width(), screenshot.height()),
+    );
+
+    Ok(Some(
+        image::imageops::crop_imm(&screenshot, crop.x, crop.y, crop.w, crop.h).to_image(),
+    ))
+}
+
+fn selected_hyprland_client(
+    target_points: &[(i32, i32)],
+    target_output_name: Option<&str>,
+) -> Result<Option<WindowCandidate>> {
+    let is_hyprland = env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some()
+        || env::var("XDG_CURRENT_DESKTOP").is_ok_and(|value| value == "Hyprland");
+    if !is_hyprland {
+        return Ok(None);
+    }
+
+    let output = Command::new("hyprctl")
+        .args(["-j", "clients"])
+        .output()
+        .context("failed to query Hyprland clients")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let clients: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("failed to parse Hyprland clients JSON")?;
+    let active_workspace_ids =
+        hyprland_active_workspace_ids(target_output_name).unwrap_or_default();
+    let candidates = hyprland_window_candidates(&clients, &active_workspace_ids);
+    Ok(selected_window_candidate(&candidates, target_points).cloned())
+}
+
+fn hyprland_active_workspace_ids(target_output_name: Option<&str>) -> Result<Vec<i64>> {
+    let output = Command::new("hyprctl")
+        .args(["-j", "monitors"])
+        .output()
+        .context("failed to query Hyprland monitors")?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+
+    let monitors: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("failed to parse Hyprland monitors JSON")?;
+    Ok(parse_hyprland_active_workspace_ids(
+        &monitors,
+        target_output_name,
+    ))
+}
+
+fn parse_hyprland_active_workspace_ids(
+    monitors: &serde_json::Value,
+    target_output_name: Option<&str>,
+) -> Vec<i64> {
+    let Some(monitors) = monitors.as_array() else {
+        return Vec::new();
+    };
+
+    monitors
+        .iter()
+        .filter(|monitor| {
+            target_output_name.is_none_or(|target| {
+                monitor
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|name| name == target)
+            })
+        })
+        .filter_map(|monitor| monitor.get("activeWorkspace")?.get("id")?.as_i64())
+        .collect()
+}
+
+fn hyprland_window_candidates(
+    clients: &serde_json::Value,
+    active_workspace_ids: &[i64],
+) -> Vec<WindowCandidate> {
+    let Some(clients) = clients.as_array() else {
+        return Vec::new();
+    };
+
+    let mut candidates = clients
+        .iter()
+        .enumerate()
+        .filter_map(|(index, client)| {
+            let mapped = client.get("mapped").and_then(serde_json::Value::as_bool)?;
+            let hidden = client
+                .get("hidden")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let visible = client
+                .get("visible")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            if !mapped || hidden || !visible {
+                return None;
+            }
+
+            let pinned = client
+                .get("pinned")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let workspace_id = client
+                .get("workspace")
+                .and_then(|workspace| workspace.get("id"))
+                .and_then(serde_json::Value::as_i64);
+            if !pinned
+                && !active_workspace_ids.is_empty()
+                && workspace_id.is_none_or(|id| !active_workspace_ids.contains(&id))
+            {
+                return None;
+            }
+
+            let at = client.get("at")?.as_array()?;
+            let size = client.get("size")?.as_array()?;
+            let x = at.first()?.as_i64()? as i32;
+            let y = at.get(1)?.as_i64()? as i32;
+            let width = size.first()?.as_u64()?.try_into().ok()?;
+            let height = size.get(1)?.as_u64()?.try_into().ok()?;
+            let focus_history_id = client
+                .get("focusHistoryID")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(index as i64);
+
+            Some((
+                focus_history_id,
+                WindowCandidate {
+                    id: index.try_into().unwrap_or_default(),
+                    x,
+                    y,
+                    width,
+                    height,
+                    minimized: false,
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(focus_history_id, _)| *focus_history_id);
+    candidates
+        .into_iter()
+        .map(|(_, candidate)| candidate)
+        .collect()
+}
+
+fn output_for_logical_rect(
+    outputs: &[LogicalOutput],
+    rect: (i32, i32, u32, u32),
+) -> Option<&LogicalOutput> {
+    let output = outputs
+        .iter()
+        .max_by_key(|output| logical_overlap_area(output, rect))?;
+    (logical_overlap_area(output, rect) > 0).then_some(output)
+}
+
+fn logical_overlap_area(output: &LogicalOutput, rect: (i32, i32, u32, u32)) -> i32 {
+    let (x, y, width, height) = rect;
+    let left = x.max(output.x);
+    let top = y.max(output.y);
+    let right = (x + width as i32).min(output.x + output.width as i32);
+    let bottom = (y + height as i32).min(output.y + output.height as i32);
+
+    (right - left).max(0) * (bottom - top).max(0)
+}
+
+fn window_target_points(selection: &WindowSelection) -> Result<Vec<(i32, i32)>> {
+    let mut points = wayland_window_target_points(selection);
+    if let Some(point) = map_window_target_to_xcap_monitor(selection)? {
+        points.push(point);
+    }
+
+    points.dedup();
+    Ok(points)
+}
+
+fn wayland_window_target_points(selection: &WindowSelection) -> Vec<(i32, i32)> {
+    let mut points = Vec::new();
+    if let Some(point) = map_window_target_to_wayland_output(selection) {
+        points.push(point);
+    }
+    points.push((selection.point.0 as i32, selection.point.1 as i32));
+    points.dedup();
+    points
+}
+
+fn map_window_target_to_wayland_output(selection: &WindowSelection) -> Option<(i32, i32)> {
+    let target_output = selection.output_name.as_ref()?;
+    let conn = libwayshot_xcap::WayshotConnection::new().ok()?;
+    let output = conn
+        .get_all_outputs()
+        .iter()
+        .find(|output| output.name == *target_output)?;
+    let region = output.logical_region.inner;
+
+    Some(map_window_target_to_monitor_bounds(
+        selection.point,
+        selection.surface_size,
+        (
+            region.position.x,
+            region.position.y,
+            region.size.width,
+            region.size.height,
+        ),
+    ))
+}
+
+fn map_window_target_to_xcap_monitor(selection: &WindowSelection) -> Result<Option<(i32, i32)>> {
     let Some(ref target_output) = selection.output_name else {
-        return Ok((selection.point.0 as i32, selection.point.1 as i32));
+        return Ok(None);
     };
 
     let monitors = Monitor::all().context("failed to enumerate monitors for window targeting")?;
@@ -600,18 +885,50 @@ fn map_window_target_to_physical(selection: &WindowSelection) -> Result<(i32, i3
         .iter()
         .find(|monitor| monitor.name().is_ok_and(|name| name == *target_output))
     else {
-        return Ok((selection.point.0 as i32, selection.point.1 as i32));
+        return Ok(None);
     };
 
     let monitor_x = monitor.x().context("failed to read monitor x position")?;
     let monitor_y = monitor.y().context("failed to read monitor y position")?;
     let monitor_w = monitor.width().context("failed to read monitor width")?;
     let monitor_h = monitor.height().context("failed to read monitor height")?;
-    Ok(map_window_target_to_monitor_bounds(
+    Ok(Some(map_window_target_to_monitor_bounds(
         selection.point,
         selection.surface_size,
         (monitor_x, monitor_y, monitor_w, monitor_h),
-    ))
+    )))
+}
+
+fn window_candidate_contains_point(candidate: &WindowCandidate, point: (i32, i32)) -> bool {
+    !candidate.minimized
+        && candidate.width > 0
+        && candidate.height > 0
+        && point.0 >= candidate.x
+        && point.1 >= candidate.y
+        && point.0 < candidate.x + candidate.width as i32
+        && point.1 < candidate.y + candidate.height as i32
+}
+
+fn selected_window_candidate<'a>(
+    candidates: &'a [WindowCandidate],
+    points: &[(i32, i32)],
+) -> Option<&'a WindowCandidate> {
+    points.iter().find_map(|point| {
+        candidates
+            .iter()
+            .find(|candidate| window_candidate_contains_point(candidate, *point))
+    })
+}
+
+fn window_label(app_name: Option<String>, title: Option<String>) -> String {
+    match (app_name, title) {
+        (Some(app), Some(title)) if !app.is_empty() && !title.is_empty() => {
+            format!(" ({app}: {title})")
+        }
+        (Some(app), _) if !app.is_empty() => format!(" ({app})"),
+        (_, Some(title)) if !title.is_empty() => format!(" ({title})"),
+        _ => String::new(),
+    }
 }
 
 fn map_window_target_to_monitor_bounds(
@@ -626,37 +943,6 @@ fn map_window_target_to_monitor_bounds(
     let y = (f64::from(point.1) * f64::from(monitor_h) / f64::from(surface_h)).round() as i32;
 
     (monitor_x + x, monitor_y + y)
-}
-
-fn window_candidate_contains_point(candidate: &WindowCandidate, point: (i32, i32)) -> bool {
-    !candidate.minimized
-        && candidate.width > 0
-        && candidate.height > 0
-        && point.0 >= candidate.x
-        && point.1 >= candidate.y
-        && point.0 < candidate.x + candidate.width as i32
-        && point.1 < candidate.y + candidate.height as i32
-}
-
-#[cfg(test)]
-fn selected_window_candidate(
-    candidates: &[WindowCandidate],
-    point: (i32, i32),
-) -> Option<&WindowCandidate> {
-    candidates
-        .iter()
-        .find(|candidate| window_candidate_contains_point(candidate, point))
-}
-
-fn window_label(app_name: Option<String>, title: Option<String>) -> String {
-    match (app_name, title) {
-        (Some(app), Some(title)) if !app.is_empty() && !title.is_empty() => {
-            format!(" ({app}: {title})")
-        }
-        (Some(app), _) if !app.is_empty() => format!(" ({app})"),
-        (_, Some(title)) if !title.is_empty() => format!(" ({title})"),
-        _ => String::new(),
-    }
 }
 
 fn map_selection_to_physical_crop(
@@ -793,14 +1079,13 @@ fn save_screenshot(
 fn copy_to_clipboard(img: &image::RgbaImage) -> Result<()> {
     // On Wayland/X11 the clipboard is "owned" by the setting process.  When
     // that process exits the content is lost.  To work around this we:
-    //   1. Write the image to a temp file.
+    //   1. Write raw RGBA image data to a temp file.
     //   2. Spawn a detached child of ourselves with `--__clipboard-daemon <path>`
     //      that reads the file, puts it on the clipboard, and blocks (`.wait()`)
     //      until something else is copied.
     //   3. The parent returns immediately.
-    let tmp = env::temp_dir().join(format!("crabture_clip_{}.png", process::id()));
-    img.save(&tmp)
-        .context("failed to write clipboard temp file")?;
+    let tmp = env::temp_dir().join(format!("crabture_clip_{}.rgba", process::id()));
+    write_clipboard_image(&tmp, img)?;
 
     let command = clipboard_daemon_command(
         env::current_exe().context("could not find own executable")?,
@@ -822,14 +1107,59 @@ fn clipboard_daemon_command(exe: PathBuf, image_path: PathBuf) -> ClipboardDaemo
     ClipboardDaemonCommand { exe, image_path }
 }
 
+fn write_clipboard_image(path: &Path, img: &image::RgbaImage) -> Result<()> {
+    let raw = img.as_raw();
+    let mut bytes = Vec::with_capacity(CLIPBOARD_IMAGE_HEADER_LEN + raw.len());
+    bytes.extend_from_slice(CLIPBOARD_IMAGE_MAGIC);
+    bytes.extend_from_slice(&img.width().to_le_bytes());
+    bytes.extend_from_slice(&img.height().to_le_bytes());
+    bytes.extend_from_slice(raw);
+
+    fs::write(path, bytes).context("failed to write clipboard temp file")
+}
+
+fn read_clipboard_image(path: &Path) -> Result<image::RgbaImage> {
+    let bytes = fs::read(path).context("clipboard daemon: failed to read image data")?;
+    if bytes.len() < CLIPBOARD_IMAGE_HEADER_LEN
+        || &bytes[..CLIPBOARD_IMAGE_MAGIC.len()] != CLIPBOARD_IMAGE_MAGIC
+    {
+        bail!("clipboard daemon: clipboard image data is corrupt");
+    }
+
+    let width = u32::from_le_bytes(
+        bytes[8..12]
+            .try_into()
+            .expect("clipboard width header has fixed length"),
+    );
+    let height = u32::from_le_bytes(
+        bytes[12..16]
+            .try_into()
+            .expect("clipboard height header has fixed length"),
+    );
+    let pixel_bytes = usize::try_from(
+        u64::from(width)
+            .checked_mul(u64::from(height))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .context("clipboard daemon: image dimensions are too large")?,
+    )
+    .context("clipboard daemon: image data is too large")?;
+    let expected_len = CLIPBOARD_IMAGE_HEADER_LEN
+        .checked_add(pixel_bytes)
+        .context("clipboard daemon: image data is too large")?;
+    if bytes.len() != expected_len {
+        bail!("clipboard daemon: clipboard image data has an invalid length");
+    }
+
+    image::RgbaImage::from_raw(width, height, bytes[CLIPBOARD_IMAGE_HEADER_LEN..].to_vec())
+        .context("clipboard daemon: failed to decode image data")
+}
+
 /// Runs in the background child process: reads the image from `path`, places it
 /// on the clipboard, and blocks until another app overwrites it.
 fn clipboard_daemon(path: &Path) -> Result<()> {
     use arboard::SetExtLinux;
 
-    let img = image::open(path)
-        .context("clipboard daemon: failed to read image")?
-        .into_rgba8();
+    let img = read_clipboard_image(path)?;
 
     // Clean up the temp file now that we have the data in memory.
     fs::remove_file(path).ok();
@@ -1089,14 +1419,189 @@ mod tests {
         ];
 
         assert_eq!(
-            selected_window_candidate(&candidates, (75, 75)),
+            selected_window_candidate(&candidates, &[(75, 75)]),
             Some(&candidates[0])
         );
         assert_eq!(
-            selected_window_candidate(&candidates, (200, 200)),
+            selected_window_candidate(&candidates, &[(200, 200)]),
             Some(&candidates[1])
         );
-        assert_eq!(selected_window_candidate(&candidates, (600, 600)), None);
+        assert_eq!(selected_window_candidate(&candidates, &[(600, 600)]), None);
+    }
+
+    #[test]
+    fn window_target_selection_tries_coordinate_fallbacks_in_order() {
+        let candidates = [
+            WindowCandidate {
+                id: 1,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                minimized: false,
+            },
+            WindowCandidate {
+                id: 2,
+                x: 500,
+                y: 100,
+                width: 200,
+                height: 200,
+                minimized: false,
+            },
+        ];
+
+        assert_eq!(
+            selected_window_candidate(&candidates, &[(300, 300), (550, 150)]),
+            Some(&candidates[1])
+        );
+    }
+
+    #[test]
+    fn parses_visible_hyprland_clients_as_window_candidates() {
+        let clients = serde_json::json!([
+            {
+                "mapped": true,
+                "hidden": false,
+                "visible": true,
+                "workspace": { "id": 3 },
+                "focusHistoryID": 1,
+                "at": [8, 47],
+                "size": [1066, 1295]
+            },
+            {
+                "mapped": true,
+                "hidden": true,
+                "visible": false,
+                "workspace": { "id": 3 },
+                "at": [0, 0],
+                "size": [100, 100]
+            }
+        ]);
+
+        assert_eq!(
+            hyprland_window_candidates(&clients, &[3]),
+            vec![WindowCandidate {
+                id: 0,
+                x: 8,
+                y: 47,
+                width: 1066,
+                height: 1295,
+                minimized: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn hyprland_window_candidates_ignore_inactive_workspaces() {
+        let clients = serde_json::json!([
+            {
+                "mapped": true,
+                "hidden": false,
+                "visible": true,
+                "workspace": { "id": 2 },
+                "at": [0, 0],
+                "size": [2160, 1350]
+            },
+            {
+                "mapped": true,
+                "hidden": false,
+                "visible": true,
+                "workspace": { "id": 3 },
+                "at": [1086, 47],
+                "size": [1066, 1295]
+            }
+        ]);
+
+        assert_eq!(
+            hyprland_window_candidates(&clients, &[3]),
+            vec![WindowCandidate {
+                id: 1,
+                x: 1086,
+                y: 47,
+                width: 1066,
+                height: 1295,
+                minimized: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn hyprland_pinned_windows_are_candidates_on_every_workspace() {
+        let clients = serde_json::json!([
+            {
+                "mapped": true,
+                "hidden": false,
+                "visible": true,
+                "pinned": true,
+                "workspace": { "id": 2 },
+                "at": [20, 30],
+                "size": [200, 100]
+            }
+        ]);
+
+        assert_eq!(
+            hyprland_window_candidates(&clients, &[3]),
+            vec![WindowCandidate {
+                id: 0,
+                x: 20,
+                y: 30,
+                width: 200,
+                height: 100,
+                minimized: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_active_hyprland_workspace_for_target_output() {
+        let monitors = serde_json::json!([
+            {
+                "name": "eDP-1",
+                "activeWorkspace": { "id": 3 }
+            },
+            {
+                "name": "HDMI-A-1",
+                "activeWorkspace": { "id": 9 }
+            }
+        ]);
+
+        assert_eq!(
+            parse_hyprland_active_workspace_ids(&monitors, Some("eDP-1")),
+            vec![3]
+        );
+        assert_eq!(
+            parse_hyprland_active_workspace_ids(&monitors, None),
+            vec![3, 9]
+        );
+    }
+
+    #[test]
+    fn selects_output_with_largest_window_overlap() {
+        let outputs = [
+            LogicalOutput {
+                name: "eDP-1".to_string(),
+                x: 0,
+                y: 0,
+                width: 1200,
+                height: 800,
+            },
+            LogicalOutput {
+                name: "HDMI-A-1".to_string(),
+                x: 1200,
+                y: 0,
+                width: 1200,
+                height: 800,
+            },
+        ];
+
+        assert_eq!(
+            output_for_logical_rect(&outputs, (1100, 100, 400, 400)).map(|output| &output.name),
+            Some(&"HDMI-A-1".to_string())
+        );
+        assert_eq!(
+            output_for_logical_rect(&outputs, (3000, 100, 400, 400)),
+            None
+        );
     }
 
     #[test]
@@ -1188,6 +1693,19 @@ mod tests {
                 Path::new("/tmp/crabture_clip_123.png")
             ]
         );
+    }
+
+    #[test]
+    fn clipboard_temp_image_round_trips_raw_rgba_data() {
+        let path = env::temp_dir().join(format!("crabture_clip_test_{}.rgba", process::id()));
+        let img = image::RgbaImage::from_raw(2, 1, vec![255, 0, 0, 255, 0, 128, 255, 255])
+            .expect("test image dimensions match pixel data");
+
+        write_clipboard_image(&path, &img).expect("write clipboard image");
+        let decoded = read_clipboard_image(&path).expect("read clipboard image");
+        fs::remove_file(&path).ok();
+
+        assert_eq!(decoded, img);
     }
 
     #[test]

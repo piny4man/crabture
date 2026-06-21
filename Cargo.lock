@@ -618,6 +618,7 @@ dependencies = [
  "image",
  "libwayshot-xcap",
  "notify-rust",
+ "serde_json",
  "smithay-client-toolkit",
  "time",
  "wayland-client",

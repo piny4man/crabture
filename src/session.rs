@@ -207,7 +207,7 @@ impl CaptureSession {
                 SessionOutcome::Continue
             }
             SessionCommand::CaptureArea(selection, preferences)
-                if self.preferences.mode == CaptureMode::Area =>
+                if preferences.mode == CaptureMode::Area =>
             {
                 self.preferences = preferences;
                 SessionOutcome::CaptureArea(selection, preferences)
@@ -216,7 +216,7 @@ impl CaptureSession {
                 SessionOutcome::Unsupported(self.unsupported_message())
             }
             SessionCommand::CaptureWindow(selection, preferences)
-                if self.preferences.mode == CaptureMode::Window =>
+                if preferences.mode == CaptureMode::Window =>
             {
                 self.preferences = preferences;
                 SessionOutcome::CaptureWindow(selection, preferences)
@@ -225,7 +225,7 @@ impl CaptureSession {
                 SessionOutcome::Unsupported(self.unsupported_message())
             }
             SessionCommand::CaptureFullScreen(selection, preferences)
-                if self.preferences.mode == CaptureMode::FullScreen =>
+                if preferences.mode == CaptureMode::FullScreen =>
             {
                 self.preferences = preferences;
                 SessionOutcome::CaptureFullScreen(selection, preferences)
@@ -338,6 +338,48 @@ mod tests {
                 preferences
             )),
             SessionOutcome::CaptureWindow(selection, preferences)
+        );
+    }
+
+    #[test]
+    fn window_capture_uses_overlay_preferences_after_toolbar_mode_change() {
+        let mut session = CaptureSession::default();
+        let preferences = GraphicalPreferences {
+            mode: CaptureMode::Window,
+            ..session.preferences()
+        };
+        let selection = WindowSelection {
+            point: (120, 80),
+            surface_size: (800, 600),
+            output_name: Some("eDP-1".to_string()),
+        };
+
+        assert_eq!(
+            session.handle(SessionCommand::CaptureWindow(
+                selection.clone(),
+                preferences
+            )),
+            SessionOutcome::CaptureWindow(selection, preferences)
+        );
+    }
+
+    #[test]
+    fn full_screen_capture_uses_overlay_preferences_after_toolbar_mode_change() {
+        let mut session = CaptureSession::default();
+        let preferences = GraphicalPreferences {
+            mode: CaptureMode::FullScreen,
+            ..session.preferences()
+        };
+        let selection = FullScreenSelection {
+            output_name: Some("eDP-1".to_string()),
+        };
+
+        assert_eq!(
+            session.handle(SessionCommand::CaptureFullScreen(
+                selection.clone(),
+                preferences
+            )),
+            SessionOutcome::CaptureFullScreen(selection, preferences)
         );
     }
 
