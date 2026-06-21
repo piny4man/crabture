@@ -353,6 +353,7 @@ pub fn run_selection_overlay() -> Result<OverlayResult> {
 
         surface_w: 0,
         surface_h: 0,
+        buffer_scale: 1,
 
         selecting: false,
         start: None,
@@ -432,6 +433,7 @@ pub fn run_screenshot_hud(default_preferences: GraphicalPreferences) -> Result<S
 
         surface_w: 0,
         surface_h: 0,
+        buffer_scale: 1,
 
         selecting: false,
         start: None,
@@ -500,6 +502,10 @@ struct OverlayState {
 
     surface_w: u32,
     surface_h: u32,
+    /// HiDPI buffer scale (integer).  The wl_shm buffer is allocated at
+    /// `surface_size * buffer_scale` physical pixels and tagged with
+    /// `set_buffer_scale` so the compositor renders it crisply.
+    buffer_scale: i32,
 
     selecting: bool,
     start: Option<(f64, f64)>,
@@ -584,17 +590,31 @@ impl OverlayState {
     }
 
     fn draw(&mut self, qh: &QueueHandle<Self>) {
-        let w = self.surface_w as usize;
-        let h = self.surface_h as usize;
-        if w == 0 || h == 0 {
+        let scale = self.buffer_scale.max(1) as usize;
+        let lw = self.surface_w as usize;
+        let lh = self.surface_h as usize;
+        if lw == 0 || lh == 0 {
             return;
         }
 
-        let stride = w as i32 * 4;
+        // Allocate the buffer at physical resolution (logical × scale) so the
+        // compositor renders it crisply on HiDPI outputs.
+        let pw = lw * scale;
+        let ph = lh * scale;
+
+        let needed = pw * ph * 4;
+        if self.pool.len() < needed {
+            match SlotPool::new(needed, &self.shm) {
+                Ok(p) => self.pool = p,
+                Err(_) => return,
+            }
+        }
+
+        let stride = pw as i32 * 4;
         let (buffer, canvas) =
             match self
                 .pool
-                .create_buffer(w as i32, h as i32, stride, wl_shm::Format::Argb8888)
+                .create_buffer(pw as i32, ph as i32, stride, wl_shm::Format::Argb8888)
             {
                 Ok(pair) => pair,
                 Err(_) => return,
@@ -603,20 +623,27 @@ impl OverlayState {
         // Interpret canvas as u32 slice for fast fills.
         // Safety: canvas is aligned and sized as wl_shm buffer (4-byte pixels).
         let pixels: &mut [u32] =
-            unsafe { std::slice::from_raw_parts_mut(canvas.as_mut_ptr() as *mut u32, w * h) };
+            unsafe { std::slice::from_raw_parts_mut(canvas.as_mut_ptr() as *mut u32, pw * ph) };
 
         if self.hud_active {
-            self.draw_hud(pixels, w, h);
+            self.draw_hud(pixels, lw, lh, scale);
         } else {
             pixels.fill(OVERLAY_PIXEL);
-            draw_selection(pixels, w, h, self.start, self.current, self.selection);
+            draw_selection(
+                pixels,
+                pw,
+                ph,
+                scaled_point(self.start, scale),
+                scaled_point(self.current, scale),
+                scaled_rect(self.selection, scale),
+            );
         }
 
-        self.layer.wl_surface().set_buffer_scale(1);
+        self.layer.wl_surface().set_buffer_scale(scale as i32);
 
         self.layer
             .wl_surface()
-            .damage_buffer(0, 0, w as i32, h as i32);
+            .damage_buffer(0, 0, pw as i32, ph as i32);
 
         buffer
             .attach_to(self.layer.wl_surface())
@@ -633,19 +660,34 @@ impl OverlayState {
         self.layer.commit();
     }
 
-    fn draw_hud(&self, pixels: &mut [u32], w: usize, h: usize) {
+    fn draw_hud(&self, pixels: &mut [u32], lw: usize, lh: usize, scale: usize) {
+        let pw = lw * scale;
+        let ph = lh * scale;
         if self.preferences.mode == CaptureMode::Area {
             pixels.fill(OVERLAY_PIXEL);
-            draw_selection(pixels, w, h, self.start, self.current, self.selection);
+            draw_selection(
+                pixels,
+                pw,
+                ph,
+                scaled_point(self.start, scale),
+                scaled_point(self.current, scale),
+                scaled_rect(self.selection, scale),
+            );
         } else if self.preferences.mode == CaptureMode::Window {
             pixels.fill(CLEAR_PIXEL);
             if let Some(point) = self.window_target {
-                draw_window_target(pixels, w, h, point);
+                draw_window_target(
+                    pixels,
+                    pw,
+                    ph,
+                    (point.0 as usize * scale, point.1 as usize * scale),
+                    scale,
+                );
             }
         } else {
             pixels.fill(CLEAR_PIXEL);
         }
-        for button in hud_buttons(w, h, self.preferences) {
+        for button in hud_buttons(lw, lh, self.preferences) {
             let fill = if button.mode == Some(self.preferences.mode) {
                 HUD_ACTIVE_PIXEL
             } else {
@@ -653,29 +695,41 @@ impl OverlayState {
             };
             fill_rect(
                 pixels,
-                w,
-                button.x,
-                button.y,
-                button.width,
-                button.height,
+                pw,
+                button.x * scale,
+                button.y * scale,
+                button.width * scale,
+                button.height * scale,
                 fill,
             );
             draw_text(
                 pixels,
-                w,
-                button.x + 14,
-                button.y + 17,
+                pw,
+                (button.x + 14) * scale,
+                (button.y + 17) * scale,
                 &button.label,
                 HUD_TEXT_PIXEL,
+                scale,
             );
         }
     }
 }
 
-fn draw_window_target(pixels: &mut [u32], w: usize, h: usize, point: (u32, u32)) {
-    let cx = point.0 as usize;
-    let cy = point.1 as usize;
-    let radius = 18usize;
+/// Scale an optional logical point into physical pixel coordinates.
+fn scaled_point(point: Option<(f64, f64)>, scale: usize) -> Option<(f64, f64)> {
+    point.map(|(x, y)| (x * scale as f64, y * scale as f64))
+}
+
+/// Scale an optional logical selection rect into physical pixel coordinates.
+fn scaled_rect(rect: Option<SelectionRect>, scale: usize) -> Option<SelectionRect> {
+    let s = scale as u32;
+    rect.map(|(x, y, w, h)| (x * s, y * s, w * s, h * s))
+}
+
+fn draw_window_target(pixels: &mut [u32], w: usize, h: usize, point: (usize, usize), scale: usize) {
+    let cx = point.0;
+    let cy = point.1;
+    let radius = 18usize * scale;
 
     if cy < h {
         let left = cx.saturating_sub(radius);
@@ -855,15 +909,31 @@ fn fill_rect(
     }
 }
 
-fn draw_text(pixels: &mut [u32], surface_w: usize, x: usize, y: usize, text: &str, pixel: u32) {
+fn draw_text(
+    pixels: &mut [u32],
+    surface_w: usize,
+    x: usize,
+    y: usize,
+    text: &str,
+    pixel: u32,
+    scale: usize,
+) {
     let mut cursor = x;
     for ch in text.chars() {
-        draw_char(pixels, surface_w, cursor, y, ch, pixel);
-        cursor += 7;
+        draw_char(pixels, surface_w, cursor, y, ch, pixel, scale);
+        cursor += 7 * scale;
     }
 }
 
-fn draw_char(pixels: &mut [u32], surface_w: usize, x: usize, y: usize, ch: char, pixel: u32) {
+fn draw_char(
+    pixels: &mut [u32],
+    surface_w: usize,
+    x: usize,
+    y: usize,
+    ch: char,
+    pixel: u32,
+    scale: usize,
+) {
     let glyph = match ch {
         'A' => [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
         'C' => [0x0F, 0x10, 0x10, 0x10, 0x10, 0x10, 0x0F],
@@ -885,7 +955,18 @@ fn draw_char(pixels: &mut [u32], surface_w: usize, x: usize, y: usize, ch: char,
     for (row_idx, row) in glyph.iter().enumerate() {
         for col in 0..5 {
             if row & (1 << (4 - col)) != 0 {
-                pixels[(y + row_idx) * surface_w + x + col] = pixel;
+                // Render each font pixel as a scale×scale block so the bitmap
+                // font stays proportionate on HiDPI buffers.
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        let px = x + col * scale + dx;
+                        let py = y + row_idx * scale + dy;
+                        let idx = py * surface_w + px;
+                        if idx < pixels.len() {
+                            pixels[idx] = pixel;
+                        }
+                    }
+                }
             }
         }
     }
@@ -899,10 +980,16 @@ impl CompositorHandler for OverlayState {
     fn scale_factor_changed(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _surface: &wl_surface::WlSurface,
-        _new_factor: i32,
+        new_factor: i32,
     ) {
+        let scale = new_factor.max(1);
+        if scale != self.buffer_scale {
+            self.buffer_scale = scale;
+            // Reallocate the buffer at the new physical resolution and redraw.
+            self.draw(qh);
+        }
     }
 
     fn transform_changed(
@@ -931,14 +1018,21 @@ impl CompositorHandler for OverlayState {
     fn surface_enter(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _surface: &wl_surface::WlSurface,
         output: &wl_output::WlOutput,
     ) {
         // Record which output the overlay landed on so we can capture the
-        // correct monitor later.
+        // correct monitor later, and seed the buffer scale from the output's
+        // reported scale factor as a first-frame fallback (a later
+        // `scale_factor_changed` event will correct it if it differs).
         if let Some(info) = self.output_state.info(output) {
             self.output_name = info.name;
+            let scale = info.scale_factor.max(1);
+            if scale != self.buffer_scale {
+                self.buffer_scale = scale;
+                self.draw(qh);
+            }
         }
     }
 
@@ -1003,8 +1097,10 @@ impl LayerShellHandler for OverlayState {
             self.surface_h = configure.new_size.1;
         }
 
-        // Allocate pool now that we know the surface size.
-        let needed = self.surface_w as usize * self.surface_h as usize * 4 * 2;
+        // Allocate pool now that we know the surface size.  Size it for the
+        // physical-resolution buffer (logical × scale, squared).
+        let scale = self.buffer_scale.max(1) as usize;
+        let needed = (self.surface_w as usize * scale) * (self.surface_h as usize * scale) * 4;
         if self.pool.len() < needed
             && let Ok(p) = SlotPool::new(needed, &self.shm)
         {
@@ -1580,11 +1676,35 @@ mod tests {
     fn draws_window_target_marker() {
         let mut pixels = vec![CLEAR_PIXEL; 20 * 20];
 
-        draw_window_target(&mut pixels, 20, 20, (10, 10));
+        draw_window_target(&mut pixels, 20, 20, (10, 10), 1);
 
         assert_eq!(pixels[10 * 20 + 10], BORDER_PIXEL);
         assert_eq!(pixels[10 * 20], BORDER_PIXEL);
         assert_eq!(pixels[10], BORDER_PIXEL);
+    }
+
+    #[test]
+    fn scales_geometry_into_physical_pixels() {
+        // A logical point/rect maps to physical coordinates at the buffer scale.
+        assert_eq!(scaled_point(Some((10.0, 20.0)), 2), Some((20.0, 40.0)));
+        assert_eq!(scaled_rect(Some((5, 6, 7, 8)), 2), Some((10, 12, 14, 16)));
+        assert_eq!(scaled_point(None, 2), None);
+        assert_eq!(scaled_rect(None, 2), None);
+    }
+
+    #[test]
+    fn draws_scaled_window_target_marker() {
+        // At scale 2 the marker is drawn in a physical-resolution buffer.
+        let mut pixels = vec![CLEAR_PIXEL; 40 * 40];
+
+        draw_window_target(&mut pixels, 40, 40, (20, 20), 2);
+
+        // Centre crosshair lands at the scaled point.
+        assert_eq!(pixels[20 * 40 + 20], BORDER_PIXEL);
+        // The crosshair arms reach 18*scale=36 pixels out, clamped to the
+        // buffer edges without overflowing.
+        assert_eq!(pixels[20 * 40], BORDER_PIXEL);
+        assert_eq!(pixels[20 * 40 + 39], BORDER_PIXEL);
     }
 
     #[test]
