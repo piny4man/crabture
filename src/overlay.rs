@@ -747,8 +747,11 @@ impl OutputOverlay {
     /// Recompute which toolbar button is under the pointer.  Returns `true`
     /// when the hovered button changed so the caller can trigger a redraw.
     fn update_hover(&mut self, lx: f64, ly: f64, preferences: GraphicalPreferences) -> bool {
-        let layout =
-            render::toolbar_layout(self.surface_w as usize, self.surface_h as usize, preferences);
+        let layout = render::toolbar_layout(
+            self.surface_w as usize,
+            self.surface_h as usize,
+            preferences,
+        );
         let hovered = render::button_at(&layout, lx, ly);
         if hovered != self.hovered_button {
             self.hovered_button = hovered;
@@ -923,22 +926,19 @@ impl OutputOverlay {
         });
         if !cache_hit {
             let layout = render::toolbar_layout(lw, lh, preferences);
-            self.toolbar_cache = render::render_toolbar(
-                &layout,
-                preferences,
-                scale,
-                self.hovered_button,
-            )
-            .map(|(pixmap, ox, oy)| ToolbarCache {
-                prefs: preferences,
-                scale,
-                hovered: self.hovered_button,
-                lw,
-                lh,
-                pixmap,
-                ox,
-                oy,
-            });
+            self.toolbar_cache =
+                render::render_toolbar(&layout, preferences, scale, self.hovered_button).map(
+                    |(pixmap, ox, oy)| ToolbarCache {
+                        prefs: preferences,
+                        scale,
+                        hovered: self.hovered_button,
+                        lw,
+                        lh,
+                        pixmap,
+                        ox,
+                        oy,
+                    },
+                );
         }
         if let Some(c) = &self.toolbar_cache {
             render::blit_argb(pixels, pw, ph, &c.pixmap, c.ox, c.oy);
