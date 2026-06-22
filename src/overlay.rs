@@ -323,23 +323,6 @@ pub fn run_selection_overlay() -> Result<OverlayResult> {
     let layer_shell = LayerShell::bind(&globals, &qh).context("wlr-layer-shell not available")?;
     let shm = Shm::bind(&globals, &qh).context("wl_shm not available")?;
 
-    let surface = compositor.create_surface(&qh);
-
-    let layer = layer_shell.create_layer_surface(
-        &qh,
-        surface,
-        Layer::Overlay,
-        Some("crabture-select"),
-        None,
-    );
-    layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
-    layer.set_exclusive_zone(-1);
-    layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
-    layer.set_size(0, 0);
-    layer.commit();
-
-    let pool = SlotPool::new(1024, &shm).context("failed to create shm pool")?;
-
     // Optional: cursor shape protocol (not all compositors support it).
     let cursor_shape_manager = CursorShapeManager::bind(&globals, &qh).ok();
 
@@ -348,41 +331,29 @@ pub fn run_selection_overlay() -> Result<OverlayResult> {
         seat_state: SeatState::new(&globals, &qh),
         output_state: OutputState::new(&globals, &qh),
         shm,
-        pool,
-        layer,
+        compositor,
+        layer_shell,
         keyboard: None,
         pointer: None,
         cursor_shape_manager,
         cursor_shape_device: None,
-
-        surface_w: 0,
-        surface_h: 0,
-        buffer_scale: 1,
-
-        selecting: false,
-        start: None,
-        current: None,
-        selection: None,
-        area_drag: None,
-        window_target: None,
-        hovered_button: None,
-        toolbar_cache: None,
+        overlays: Vec::new(),
+        active_surface: None,
         window_rects: Vec::new(),
-        output_origin: (0, 0),
-        highlighted_window: None,
-
-        output_name: None,
-
-        dirty: false,
-        frame_pending: false,
-
-        first_configure: true,
-        exit: false,
-        cancelled: false,
         hud_active: false,
         preferences: GraphicalPreferences::default(),
         hud_result: None,
+        selection_result: None,
+        exit: false,
+        cancelled: false,
     };
+
+    // Output geometry isn't available synchronously: pump the queue once so the
+    // registry/xdg-output events populate OutputState before we place surfaces.
+    event_queue
+        .roundtrip(&mut state)
+        .context("Wayland roundtrip error")?;
+    state.create_overlays(&qh, "crabture-select");
 
     loop {
         event_queue
@@ -393,16 +364,18 @@ pub fn run_selection_overlay() -> Result<OverlayResult> {
         }
     }
 
-    let surf = (state.surface_w, state.surface_h);
-    let output_name = state.output_name.clone();
-    teardown_layer_surface(&conn, &state.layer);
+    let result = if state.cancelled {
+        (None, (0, 0), None)
+    } else {
+        state
+            .selection_result
+            .clone()
+            .unwrap_or((None, (0, 0), None))
+    };
+    state.teardown(&conn);
     event_queue.roundtrip(&mut state).ok();
 
-    if state.cancelled {
-        return Ok((None, surf, output_name));
-    }
-
-    Ok((state.selection, surf, output_name))
+    Ok(result)
 }
 
 pub fn run_screenshot_hud(
@@ -417,18 +390,6 @@ pub fn run_screenshot_hud(
     let compositor = CompositorState::bind(&globals, &qh).context("wl_compositor not available")?;
     let layer_shell = LayerShell::bind(&globals, &qh).context("wlr-layer-shell not available")?;
     let shm = Shm::bind(&globals, &qh).context("wl_shm not available")?;
-
-    let surface = compositor.create_surface(&qh);
-
-    let layer =
-        layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("crabture-hud"), None);
-    layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
-    layer.set_exclusive_zone(-1);
-    layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
-    layer.set_size(0, 0);
-    layer.commit();
-
-    let pool = SlotPool::new(1024, &shm).context("failed to create shm pool")?;
     let cursor_shape_manager = CursorShapeManager::bind(&globals, &qh).ok();
 
     let mut state = OverlayState {
@@ -436,41 +397,29 @@ pub fn run_screenshot_hud(
         seat_state: SeatState::new(&globals, &qh),
         output_state: OutputState::new(&globals, &qh),
         shm,
-        pool,
-        layer,
+        compositor,
+        layer_shell,
         keyboard: None,
         pointer: None,
         cursor_shape_manager,
         cursor_shape_device: None,
-
-        surface_w: 0,
-        surface_h: 0,
-        buffer_scale: 1,
-
-        selecting: false,
-        start: None,
-        current: None,
-        selection: None,
-        area_drag: None,
-        window_target: None,
-        hovered_button: None,
-        toolbar_cache: None,
+        overlays: Vec::new(),
+        active_surface: None,
         window_rects,
-        output_origin: (0, 0),
-        highlighted_window: None,
-
-        output_name: None,
-
-        dirty: false,
-        frame_pending: false,
-
-        first_configure: true,
-        exit: false,
-        cancelled: false,
         hud_active: true,
         preferences: default_preferences,
         hud_result: None,
+        selection_result: None,
+        exit: false,
+        cancelled: false,
     };
+
+    // Output geometry isn't available synchronously: pump the queue once so the
+    // registry/xdg-output events populate OutputState before we place surfaces.
+    event_queue
+        .roundtrip(&mut state)
+        .context("Wayland roundtrip error")?;
+    state.create_overlays(&qh, "crabture-hud");
 
     loop {
         event_queue
@@ -481,14 +430,12 @@ pub fn run_screenshot_hud(
         }
     }
 
-    if state.cancelled {
-        teardown_layer_surface(&conn, &state.layer);
-        event_queue.roundtrip(&mut state).ok();
-        return Ok(SessionCommand::Cancel);
-    }
-
-    let result = state.hud_result.clone().unwrap_or(SessionCommand::Cancel);
-    teardown_layer_surface(&conn, &state.layer);
+    let result = if state.cancelled {
+        SessionCommand::Cancel
+    } else {
+        state.hud_result.clone().unwrap_or(SessionCommand::Cancel)
+    };
+    state.teardown(&conn);
     event_queue.roundtrip(&mut state).ok();
     Ok(result)
 }
@@ -519,17 +466,14 @@ struct ToolbarCache {
     oy: i32,
 }
 
-struct OverlayState {
-    registry_state: RegistryState,
-    seat_state: SeatState,
-    output_state: OutputState,
-    shm: Shm,
-    pool: SlotPool,
+/// Per-monitor overlay surface and its selection state.  One of these is
+/// created for every Wayland output so the capture UI spans all monitors and
+/// the user can select on any of them — not just the focused one.
+struct OutputOverlay {
     layer: LayerSurface,
-    keyboard: Option<wl_keyboard::WlKeyboard>,
-    pointer: Option<wl_pointer::WlPointer>,
-    cursor_shape_manager: Option<CursorShapeManager>,
-    cursor_shape_device: Option<WpCursorShapeDeviceV1>,
+    /// Per-output shm pool: each surface draws its own buffer at its own
+    /// physical resolution (logical × scale), so mixed-DPI setups stay crisp.
+    pool: SlotPool,
 
     surface_w: u32,
     surface_h: u32,
@@ -551,40 +495,195 @@ struct OverlayState {
     /// motion redraw the canvas every frame but must not re-rasterize the
     /// toolbar's SVG icons and text each time.
     toolbar_cache: Option<ToolbarCache>,
-    /// On-screen windows as global logical rectangles, ordered like the
-    /// capture's window selection, used to highlight the hovered window in
-    /// window mode.  Empty when window enumeration was unavailable.
-    window_rects: Vec<(i32, i32, u32, u32)>,
-    /// Logical position of the overlay's output, used to translate the
-    /// surface-local pointer into the global coordinate space `window_rects`
-    /// live in.  Seeded from `OutputInfo::logical_position` on `surface_enter`.
+    /// Logical position of this output, used to translate the surface-local
+    /// pointer into the global coordinate space `window_rects` live in.
+    /// Seeded from `OutputInfo::logical_position`.
     output_origin: (i32, i32),
     /// The hovered window in surface-local logical coordinates, highlighted in
     /// window mode.  `None` when the pointer is over empty space or the toolbar.
     highlighted_window: Option<(i32, i32, u32, u32)>,
-
-    /// Name of the output the overlay surface is on (e.g. "eDP-1", "HDMI-A-1").
+    /// Name of the output this overlay is on (e.g. "eDP-1", "HDMI-A-1").
     output_name: Option<String>,
 
-    /// True when the selection changed and we need a redraw.
+    /// True when this surface changed and needs a redraw.
     dirty: bool,
     /// True when we've requested a frame callback and are waiting for it.
     frame_pending: bool,
-
     first_configure: bool,
-    exit: bool,
-    cancelled: bool,
+}
+
+struct OverlayState {
+    registry_state: RegistryState,
+    seat_state: SeatState,
+    output_state: OutputState,
+    shm: Shm,
+    /// Kept so we can lazily create a fallback surface if no outputs resolve.
+    compositor: CompositorState,
+    layer_shell: LayerShell,
+    keyboard: Option<wl_keyboard::WlKeyboard>,
+    pointer: Option<wl_pointer::WlPointer>,
+    cursor_shape_manager: Option<CursorShapeManager>,
+    cursor_shape_device: Option<WpCursorShapeDeviceV1>,
+
+    /// One overlay surface per monitor.
+    overlays: Vec<OutputOverlay>,
+    /// The surface the pointer is currently over.  The macOS-style toolbar
+    /// renders on this output, and keyboard capture / full-screen act on it.
+    active_surface: Option<wl_surface::WlSurface>,
+
+    /// On-screen windows as global logical rectangles, ordered like the
+    /// capture's window selection, used to highlight the hovered window in
+    /// window mode.  Empty when window enumeration was unavailable.
+    window_rects: Vec<(i32, i32, u32, u32)>,
+
     hud_active: bool,
     preferences: GraphicalPreferences,
+    /// Result of the HUD session (capture command or cancel).
     hud_result: Option<SessionCommand>,
+    /// Result of the legacy `--select` overlay: the completed selection, its
+    /// output's surface size, and that output's name.
+    selection_result: Option<OverlayResult>,
+    exit: bool,
+    cancelled: bool,
 }
 
 impl OverlayState {
+    /// Create one layer-shell overlay surface per Wayland output so the capture
+    /// UI spans every monitor.  Falls back to a single compositor-placed surface
+    /// when no outputs are known (degrading to the old single-monitor behavior).
+    fn create_overlays(&mut self, qh: &QueueHandle<Self>, namespace: &str) {
+        let outputs: Vec<wl_output::WlOutput> = self.output_state.outputs().collect();
+        if outputs.is_empty() {
+            self.push_overlay(qh, namespace, None);
+        } else {
+            for output in outputs {
+                self.push_overlay(qh, namespace, Some(output));
+            }
+        }
+        // Seed the active surface to the first overlay so the toolbar has a home
+        // before the pointer enters any monitor.
+        self.active_surface = self.overlays.first().map(|o| o.layer.wl_surface().clone());
+    }
+
+    fn push_overlay(
+        &mut self,
+        qh: &QueueHandle<Self>,
+        namespace: &str,
+        output: Option<wl_output::WlOutput>,
+    ) {
+        let pool = match SlotPool::new(1024, &self.shm) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let surface = self.compositor.create_surface(qh);
+        let layer = self.layer_shell.create_layer_surface(
+            qh,
+            surface,
+            Layer::Overlay,
+            Some(namespace),
+            output.as_ref(),
+        );
+        layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+        layer.set_exclusive_zone(-1);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+        layer.set_size(0, 0);
+        layer.commit();
+
+        // Seed geometry from the output's advertised info; refined later by
+        // surface_enter / configure / scale_factor_changed.
+        let (output_name, output_origin, buffer_scale) = output
+            .as_ref()
+            .and_then(|o| self.output_state.info(o))
+            .map(|info| {
+                (
+                    info.name,
+                    info.logical_position.unwrap_or((0, 0)),
+                    info.scale_factor.max(1),
+                )
+            })
+            .unwrap_or((None, (0, 0), 1));
+
+        self.overlays.push(OutputOverlay {
+            layer,
+            pool,
+            surface_w: 0,
+            surface_h: 0,
+            buffer_scale,
+            selecting: false,
+            start: None,
+            current: None,
+            selection: None,
+            area_drag: None,
+            window_target: None,
+            hovered_button: None,
+            toolbar_cache: None,
+            output_origin,
+            highlighted_window: None,
+            output_name,
+            dirty: false,
+            frame_pending: false,
+            first_configure: true,
+        });
+    }
+
+    fn teardown(&self, conn: &Connection) {
+        for ov in &self.overlays {
+            teardown_layer_surface(conn, &ov.layer);
+        }
+    }
+
+    /// Index of the overlay owning `surface`, if any.
+    fn index_for_surface(&self, surface: &wl_surface::WlSurface) -> Option<usize> {
+        self.overlays
+            .iter()
+            .position(|o| o.layer.wl_surface() == surface)
+    }
+
+    /// Index of the overlay owning `layer`, if any.
+    fn index_for_layer(&self, layer: &LayerSurface) -> Option<usize> {
+        self.overlays
+            .iter()
+            .position(|o| o.layer.wl_surface() == layer.wl_surface())
+    }
+
+    /// Index of the overlay the pointer is currently over (the active output).
+    fn active_index(&self) -> Option<usize> {
+        let surface = self.active_surface.as_ref()?;
+        self.index_for_surface(surface)
+    }
+
+    /// Name of the active output (the monitor the pointer is on).
+    fn active_output_name(&self) -> Option<String> {
+        self.active_index()
+            .and_then(|i| self.overlays[i].output_name.clone())
+    }
+
+    /// Redraw a single overlay surface.  Splits the shared, read-only session
+    /// state (`shm`, prefs, window rects, active flag) out as disjoint borrows
+    /// so the per-output drawing can take `&mut self.overlays[idx]`.
+    fn redraw(&mut self, idx: usize, qh: &QueueHandle<Self>) {
+        let is_active = self.active_index() == Some(idx);
+        let shm = &self.shm;
+        let preferences = self.preferences;
+        let hud_active = self.hud_active;
+        if let Some(ov) = self.overlays.get_mut(idx) {
+            ov.draw(qh, shm, preferences, hud_active, is_active);
+        }
+    }
+
+    /// Redraw every overlay surface (used when a preference that affects all
+    /// monitors — mode, output, format, location — changes).
+    fn redraw_all(&mut self, qh: &QueueHandle<Self>) {
+        for idx in 0..self.overlays.len() {
+            self.redraw(idx, qh);
+        }
+    }
+
     fn activate_mode(&mut self, mode: CaptureMode, qh: &QueueHandle<Self>) {
-        match mode_selection_command(mode, self.output_name.clone(), self.preferences) {
+        match mode_selection_command(mode, self.active_output_name(), self.preferences) {
             SessionCommand::SetMode(mode) => {
                 self.preferences.mode = mode;
-                self.draw(qh);
+                self.redraw_all(qh);
             }
             command @ SessionCommand::CaptureFullScreen(_, _) => {
                 self.hud_result = Some(command);
@@ -601,15 +700,15 @@ impl OverlayState {
             }
             SessionCommand::SetOutput(output) => {
                 self.preferences.output = output;
-                self.draw(qh);
+                self.redraw_all(qh);
             }
             SessionCommand::SetFormat(format) => {
                 self.preferences.format = format;
-                self.draw(qh);
+                self.redraw_all(qh);
             }
             SessionCommand::SetLocation(location) => {
                 self.preferences.location = location;
-                self.draw(qh);
+                self.redraw_all(qh);
             }
             SessionCommand::Capture => {
                 self.hud_result = Some(self.capture_or_error_command());
@@ -628,23 +727,30 @@ impl OverlayState {
         }
     }
 
+    /// Build the capture command from the active overlay's selection / target.
     fn capture_or_error_command(&self) -> SessionCommand {
+        let Some(idx) = self.active_index() else {
+            return SessionCommand::Capture;
+        };
+        let ov = &self.overlays[idx];
         confirmed_capture_command(
             self.preferences,
-            self.selection,
-            self.window_target,
-            (self.surface_w, self.surface_h),
-            self.output_name.clone(),
+            ov.selection,
+            ov.window_target,
+            (ov.surface_w, ov.surface_h),
+            ov.output_name.clone(),
         )
     }
+}
 
+impl OutputOverlay {
     /// Recompute which toolbar button is under the pointer.  Returns `true`
     /// when the hovered button changed so the caller can trigger a redraw.
-    fn update_hover(&mut self, lx: f64, ly: f64) -> bool {
+    fn update_hover(&mut self, lx: f64, ly: f64, preferences: GraphicalPreferences) -> bool {
         let layout = render::toolbar_layout(
             self.surface_w as usize,
             self.surface_h as usize,
-            self.preferences,
+            preferences,
         );
         let hovered = render::button_at(&layout, lx, ly);
         if hovered != self.hovered_button {
@@ -658,11 +764,16 @@ impl OverlayState {
     /// Recompute which window the pointer is over (window mode).  The pointer is
     /// suppressed while over the toolbar so we never highlight a window behind
     /// it.  Returns `true` when the highlight changed.
-    fn update_window_highlight(&mut self, lx: f64, ly: f64) -> bool {
+    fn update_window_highlight(
+        &mut self,
+        lx: f64,
+        ly: f64,
+        window_rects: &[(i32, i32, u32, u32)],
+    ) -> bool {
         let highlight = if self.hovered_button.is_some() {
             None
         } else {
-            window_rect_at_point(&self.window_rects, self.output_origin, (lx, ly))
+            window_rect_at_point(window_rects, self.output_origin, (lx, ly))
         };
         if highlight != self.highlighted_window {
             self.highlighted_window = highlight;
@@ -672,7 +783,14 @@ impl OverlayState {
         }
     }
 
-    fn draw(&mut self, qh: &QueueHandle<Self>) {
+    fn draw(
+        &mut self,
+        qh: &QueueHandle<OverlayState>,
+        shm: &Shm,
+        preferences: GraphicalPreferences,
+        hud_active: bool,
+        is_active: bool,
+    ) {
         let scale = self.buffer_scale.max(1) as usize;
         let lw = self.surface_w as usize;
         let lh = self.surface_h as usize;
@@ -687,7 +805,7 @@ impl OverlayState {
 
         let needed = pw * ph * 4;
         if self.pool.len() < needed {
-            match SlotPool::new(needed, &self.shm) {
+            match SlotPool::new(needed, shm) {
                 Ok(p) => self.pool = p,
                 Err(_) => return,
             }
@@ -708,8 +826,8 @@ impl OverlayState {
         let pixels: &mut [u32] =
             unsafe { std::slice::from_raw_parts_mut(canvas.as_mut_ptr() as *mut u32, pw * ph) };
 
-        if self.hud_active {
-            self.draw_hud(pixels, lw, lh, scale);
+        if hud_active {
+            self.draw_hud(pixels, lw, lh, scale, preferences, is_active);
         } else {
             pixels.fill(OVERLAY_PIXEL);
             draw_selection(
@@ -748,10 +866,18 @@ impl OverlayState {
         self.layer.commit();
     }
 
-    fn draw_hud(&mut self, pixels: &mut [u32], lw: usize, lh: usize, scale: usize) {
+    fn draw_hud(
+        &mut self,
+        pixels: &mut [u32],
+        lw: usize,
+        lh: usize,
+        scale: usize,
+        preferences: GraphicalPreferences,
+        is_active: bool,
+    ) {
         let pw = lw * scale;
         let ph = lh * scale;
-        if self.preferences.mode == CaptureMode::Area {
+        if preferences.mode == CaptureMode::Area {
             pixels.fill(OVERLAY_PIXEL);
             draw_selection(
                 pixels,
@@ -761,7 +887,7 @@ impl OverlayState {
                 scaled_point(self.current, scale),
                 scaled_rect(self.selection, scale),
             );
-        } else if self.preferences.mode == CaptureMode::Window {
+        } else if preferences.mode == CaptureMode::Window {
             pixels.fill(CLEAR_PIXEL);
             if let Some(rect) = self.highlighted_window {
                 draw_window_highlight(pixels, pw, ph, rect, scale);
@@ -778,26 +904,32 @@ impl OverlayState {
             pixels.fill(CLEAR_PIXEL);
         }
 
-        // Composite the macOS-style toolbar over the canvas.  Rasterizing it
-        // (SVG icons + anti-aliased text) is comparatively expensive, so cache
-        // the rendered pixmap and only rebuild when an input that affects the
-        // toolbar changes — never on plain window-target / area-drag motion,
-        // which redraw the canvas every frame.  Layout is in logical
-        // coordinates so it stays in sync with the pointer hit-test; the
-        // renderer scales it to the physical buffer resolution.
+        // Only the active output (the monitor the pointer is on) composites the
+        // macOS-style toolbar, so it follows the cursor across displays.
+        if !is_active {
+            return;
+        }
+
+        // Composite the toolbar over the canvas.  Rasterizing it (SVG icons +
+        // anti-aliased text) is comparatively expensive, so cache the rendered
+        // pixmap and only rebuild when an input that affects the toolbar changes
+        // — never on plain window-target / area-drag motion, which redraw the
+        // canvas every frame.  Layout is in logical coordinates so it stays in
+        // sync with the pointer hit-test; the renderer scales it to the physical
+        // buffer resolution.
         let cache_hit = self.toolbar_cache.as_ref().is_some_and(|c| {
-            c.prefs == self.preferences
+            c.prefs == preferences
                 && c.scale == scale
                 && c.hovered == self.hovered_button
                 && c.lw == lw
                 && c.lh == lh
         });
         if !cache_hit {
-            let layout = render::toolbar_layout(lw, lh, self.preferences);
+            let layout = render::toolbar_layout(lw, lh, preferences);
             self.toolbar_cache =
-                render::render_toolbar(&layout, self.preferences, scale, self.hovered_button).map(
+                render::render_toolbar(&layout, preferences, scale, self.hovered_button).map(
                     |(pixmap, ox, oy)| ToolbarCache {
-                        prefs: self.preferences,
+                        prefs: preferences,
                         scale,
                         hovered: self.hovered_button,
                         lw,
@@ -972,14 +1104,16 @@ impl CompositorHandler for OverlayState {
         &mut self,
         _conn: &Connection,
         qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         new_factor: i32,
     ) {
         let scale = new_factor.max(1);
-        if scale != self.buffer_scale {
-            self.buffer_scale = scale;
+        if let Some(idx) = self.index_for_surface(surface)
+            && scale != self.overlays[idx].buffer_scale
+        {
+            self.overlays[idx].buffer_scale = scale;
             // Reallocate the buffer at the new physical resolution and redraw.
-            self.draw(qh);
+            self.redraw(idx, qh);
         }
     }
 
@@ -996,13 +1130,15 @@ impl CompositorHandler for OverlayState {
         &mut self,
         _conn: &Connection,
         qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
-        self.frame_pending = false;
-        if self.dirty {
-            self.dirty = false;
-            self.draw(qh);
+        if let Some(idx) = self.index_for_surface(surface) {
+            self.overlays[idx].frame_pending = false;
+            if self.overlays[idx].dirty {
+                self.overlays[idx].dirty = false;
+                self.redraw(idx, qh);
+            }
         }
     }
 
@@ -1010,22 +1146,25 @@ impl CompositorHandler for OverlayState {
         &mut self,
         _conn: &Connection,
         qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         output: &wl_output::WlOutput,
     ) {
-        // Record which output the overlay landed on so we can capture the
-        // correct monitor later, and seed the buffer scale from the output's
-        // reported scale factor as a first-frame fallback (a later
-        // `scale_factor_changed` event will correct it if it differs).
+        // Refine the overlay's output identity/geometry from the output it
+        // actually landed on, and seed the buffer scale from the reported scale
+        // factor as a first-frame fallback (a later `scale_factor_changed`
+        // event will correct it if it differs).
+        let Some(idx) = self.index_for_surface(surface) else {
+            return;
+        };
         if let Some(info) = self.output_state.info(output) {
-            self.output_name = info.name;
+            self.overlays[idx].output_name = info.name;
             // Translate window rects (global logical) into this output's local
             // space when highlighting the hovered window.
-            self.output_origin = info.logical_position.unwrap_or((0, 0));
+            self.overlays[idx].output_origin = info.logical_position.unwrap_or((0, 0));
             let scale = info.scale_factor.max(1);
-            if scale != self.buffer_scale {
-                self.buffer_scale = scale;
-                self.draw(qh);
+            if scale != self.overlays[idx].buffer_scale {
+                self.overlays[idx].buffer_scale = scale;
+                self.redraw(idx, qh);
             }
         }
     }
@@ -1080,30 +1219,40 @@ impl LayerShellHandler for OverlayState {
         &mut self,
         _conn: &Connection,
         qh: &QueueHandle<Self>,
-        _layer: &LayerSurface,
+        layer: &LayerSurface,
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
-        if configure.new_size.0 > 0 {
-            self.surface_w = configure.new_size.0;
-        }
-        if configure.new_size.1 > 0 {
-            self.surface_h = configure.new_size.1;
-        }
+        let Some(idx) = self.index_for_layer(layer) else {
+            return;
+        };
 
-        // Allocate pool now that we know the surface size.  Size it for the
-        // physical-resolution buffer (logical × scale, squared).
-        let scale = self.buffer_scale.max(1) as usize;
-        let needed = (self.surface_w as usize * scale) * (self.surface_h as usize * scale) * 4;
-        if self.pool.len() < needed
-            && let Ok(p) = SlotPool::new(needed, &self.shm)
-        {
-            self.pool = p;
-        }
+        let first = {
+            let shm = &self.shm;
+            let ov = &mut self.overlays[idx];
+            if configure.new_size.0 > 0 {
+                ov.surface_w = configure.new_size.0;
+            }
+            if configure.new_size.1 > 0 {
+                ov.surface_h = configure.new_size.1;
+            }
 
-        if self.first_configure {
-            self.first_configure = false;
-            self.draw(qh);
+            // Allocate pool now that we know the surface size.  Size it for the
+            // physical-resolution buffer (logical × scale, squared).
+            let scale = ov.buffer_scale.max(1) as usize;
+            let needed = (ov.surface_w as usize * scale) * (ov.surface_h as usize * scale) * 4;
+            if ov.pool.len() < needed
+                && let Ok(p) = SlotPool::new(needed, shm)
+            {
+                ov.pool = p;
+            }
+
+            ov.first_configure
+        };
+
+        if first {
+            self.overlays[idx].first_configure = false;
+            self.redraw(idx, qh);
         }
     }
 }
@@ -1214,16 +1363,18 @@ impl KeyboardHandler for OverlayState {
             }
             Keysym::space if self.preferences.mode == CaptureMode::Area => {
                 self.preferences.mode = CaptureMode::Window;
-                self.selection = None;
-                self.start = None;
-                self.current = None;
-                self.area_drag = None;
-                self.draw(qh);
+                for ov in &mut self.overlays {
+                    ov.selection = None;
+                    ov.start = None;
+                    ov.current = None;
+                    ov.area_drag = None;
+                }
+                self.redraw_all(qh);
             }
             _ => {
                 if let Some(command) = shortcut_session_command(
                     event.keysym,
-                    self.output_name.clone(),
+                    self.active_output_name(),
                     self.preferences,
                 ) {
                     self.apply_hud_command(command, qh);
@@ -1273,12 +1424,15 @@ impl PointerHandler for OverlayState {
         _pointer: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
-        let mut needs_redraw = false;
+        // Deferred (frame-throttled) redraw target.  At most one surface sees
+        // motion per frame, so a single index is sufficient.
+        let mut pending_redraw: Option<usize> = None;
 
         for event in events {
-            if &event.surface != self.layer.wl_surface() {
+            // Route each event to the overlay owning the surface it occurred on.
+            let Some(idx) = self.index_for_surface(&event.surface) else {
                 continue;
-            }
+            };
 
             let lx = event.position.0;
             let ly = event.position.1;
@@ -1289,54 +1443,71 @@ impl PointerHandler for OverlayState {
                     if let Some(ref device) = self.cursor_shape_device {
                         device.set_shape(serial, Shape::Crosshair);
                     }
+                    // The toolbar lives on the monitor the pointer is over, so
+                    // make this surface active and repaint the old + new homes
+                    // so the toolbar relocates to the cursor's display.
+                    let prev = self.active_index();
+                    if prev != Some(idx) {
+                        self.active_surface = Some(event.surface.clone());
+                        if let Some(p) = prev {
+                            self.redraw(p, qh);
+                        }
+                        self.redraw(idx, qh);
+                    }
                 }
                 PointerEventKind::Press { button, .. } => {
                     if self.hud_active {
                         let mode = self.preferences.mode;
                         if button == 0x110 {
                             let mut layout = render::toolbar_layout(
-                                self.surface_w as usize,
-                                self.surface_h as usize,
+                                self.overlays[idx].surface_w as usize,
+                                self.overlays[idx].surface_h as usize,
                                 self.preferences,
                             );
-                            if let Some(idx) = render::button_at(&layout, lx, ly) {
-                                let command = layout.swap_remove(idx).command;
+                            if let Some(button_idx) = render::button_at(&layout, lx, ly) {
+                                let command = layout.swap_remove(button_idx).command;
                                 self.apply_hud_command(command, qh);
                                 return;
                             }
                             if mode == CaptureMode::Area {
                                 let point = (lx.round() as i32, ly.round() as i32);
-                                self.area_drag = if let Some(rect) = self.selection {
-                                    if let Some(handle) = hit_resize_handle(rect, point) {
-                                        Some(AreaDrag::Resizing {
-                                            original: rect,
-                                            handle,
-                                        })
-                                    } else if point_in_rect(rect, point) {
-                                        Some(AreaDrag::Moving {
-                                            original: rect,
-                                            pointer_start: point,
-                                        })
+                                {
+                                    let ov = &mut self.overlays[idx];
+                                    ov.area_drag = if let Some(rect) = ov.selection {
+                                        if let Some(handle) = hit_resize_handle(rect, point) {
+                                            Some(AreaDrag::Resizing {
+                                                original: rect,
+                                                handle,
+                                            })
+                                        } else if point_in_rect(rect, point) {
+                                            Some(AreaDrag::Moving {
+                                                original: rect,
+                                                pointer_start: point,
+                                            })
+                                        } else {
+                                            ov.selection = None;
+                                            ov.start = Some((lx, ly));
+                                            ov.current = Some((lx, ly));
+                                            Some(AreaDrag::Drawing)
+                                        }
                                     } else {
-                                        self.selection = None;
-                                        self.start = Some((lx, ly));
-                                        self.current = Some((lx, ly));
+                                        ov.start = Some((lx, ly));
+                                        ov.current = Some((lx, ly));
                                         Some(AreaDrag::Drawing)
-                                    }
-                                } else {
-                                    self.start = Some((lx, ly));
-                                    self.current = Some((lx, ly));
-                                    Some(AreaDrag::Drawing)
-                                };
-                                self.selecting = true;
-                                self.draw(qh);
+                                    };
+                                    ov.selecting = true;
+                                }
+                                self.redraw(idx, qh);
                             } else if mode == CaptureMode::Window {
                                 let point = (lx.round() as u32, ly.round() as u32);
-                                self.window_target = Some(point);
+                                let surface_size =
+                                    (self.overlays[idx].surface_w, self.overlays[idx].surface_h);
+                                let output_name = self.overlays[idx].output_name.clone();
+                                self.overlays[idx].window_target = Some(point);
                                 self.hud_result = Some(capture_window_command(
                                     point,
-                                    (self.surface_w, self.surface_h),
-                                    self.output_name.clone(),
+                                    surface_size,
+                                    output_name,
                                     self.preferences,
                                 ));
                                 self.exit = true;
@@ -1350,11 +1521,13 @@ impl PointerHandler for OverlayState {
                     }
 
                     if button == 0x110 {
-                        self.start = Some((lx, ly));
-                        self.current = Some((lx, ly));
-                        self.area_drag = Some(AreaDrag::Drawing);
-                        self.selecting = true;
-                        needs_redraw = true;
+                        self.active_surface = Some(event.surface.clone());
+                        let ov = &mut self.overlays[idx];
+                        ov.start = Some((lx, ly));
+                        ov.current = Some((lx, ly));
+                        ov.area_drag = Some(AreaDrag::Drawing);
+                        ov.selecting = true;
+                        pending_redraw = Some(idx);
                     }
                     if button == 0x111 {
                         self.cancelled = true;
@@ -1363,83 +1536,96 @@ impl PointerHandler for OverlayState {
                     }
                 }
                 PointerEventKind::Release { button, .. } => {
-                    if button == 0x110 && self.selecting {
-                        if matches!(self.area_drag, Some(AreaDrag::Drawing))
-                            && let (Some((sx, sy)), Some((cx, cy))) = (self.start, self.current)
+                    if button == 0x110 && self.overlays[idx].selecting {
                         {
-                            let rect = clamp_selection_rect(
-                                selection_rect_from_drag((sx, sy), (cx, cy)),
-                                (self.surface_w, self.surface_h),
-                            );
-                            self.selection = Some(rect);
-                            self.start = None;
-                            self.current = None;
-                            if !self.hud_active {
-                                self.hud_result = Some(capture_area_command(
-                                    rect,
-                                    (self.surface_w, self.surface_h),
-                                    self.output_name.clone(),
-                                    self.preferences,
-                                ));
+                            let ov = &mut self.overlays[idx];
+                            if matches!(ov.area_drag, Some(AreaDrag::Drawing))
+                                && let (Some((sx, sy)), Some((cx, cy))) = (ov.start, ov.current)
+                            {
+                                let rect = clamp_selection_rect(
+                                    selection_rect_from_drag((sx, sy), (cx, cy)),
+                                    (ov.surface_w, ov.surface_h),
+                                );
+                                ov.selection = Some(rect);
+                                ov.start = None;
+                                ov.current = None;
                             }
+                            ov.selecting = false;
+                            ov.area_drag = None;
                         }
-                        self.selecting = false;
-                        self.area_drag = None;
                         if !self.hud_active {
+                            // Legacy `--select`: return the completed selection
+                            // along with this output's size and identity.
+                            let ov = &self.overlays[idx];
+                            let result = (
+                                ov.selection,
+                                (ov.surface_w, ov.surface_h),
+                                ov.output_name.clone(),
+                            );
+                            self.selection_result = Some(result);
                             self.exit = true;
                         } else {
-                            self.draw(qh);
+                            self.redraw(idx, qh);
                         }
                         return;
                     }
                 }
-                PointerEventKind::Motion { .. } if self.selecting => {
-                    match self.area_drag {
-                        Some(AreaDrag::Drawing) => self.current = Some((lx, ly)),
+                PointerEventKind::Motion { .. } if self.overlays[idx].selecting => {
+                    let ov = &mut self.overlays[idx];
+                    let surface_size = (ov.surface_w, ov.surface_h);
+                    match ov.area_drag {
+                        Some(AreaDrag::Drawing) => ov.current = Some((lx, ly)),
                         Some(AreaDrag::Moving {
                             original,
                             pointer_start,
                         }) => {
-                            self.selection = Some(move_selection_rect(
+                            ov.selection = Some(move_selection_rect(
                                 original,
                                 (
                                     lx.round() as i32 - pointer_start.0,
                                     ly.round() as i32 - pointer_start.1,
                                 ),
-                                (self.surface_w, self.surface_h),
+                                surface_size,
                             ));
                         }
                         Some(AreaDrag::Resizing { original, handle }) => {
-                            self.selection = Some(resize_selection_rect(
+                            ov.selection = Some(resize_selection_rect(
                                 original,
                                 handle,
                                 (lx.round() as i32, ly.round() as i32),
-                                (self.surface_w, self.surface_h),
+                                surface_size,
                             ));
                         }
                         None => {}
                     }
-                    needs_redraw = true;
+                    pending_redraw = Some(idx);
                 }
                 PointerEventKind::Motion { .. } if self.hud_active => {
-                    if self.update_hover(lx, ly) {
-                        needs_redraw = true;
+                    let preferences = self.preferences;
+                    let mut changed = false;
+                    if self.overlays[idx].update_hover(lx, ly, preferences) {
+                        changed = true;
                     }
-                    if self.preferences.mode == CaptureMode::Window {
-                        self.window_target = Some((lx.round() as u32, ly.round() as u32));
-                        self.update_window_highlight(lx, ly);
-                        needs_redraw = true;
+                    if preferences.mode == CaptureMode::Window {
+                        let window_rects = &self.window_rects;
+                        let ov = &mut self.overlays[idx];
+                        ov.window_target = Some((lx.round() as u32, ly.round() as u32));
+                        ov.update_window_highlight(lx, ly, window_rects);
+                        changed = true;
+                    }
+                    if changed {
+                        pending_redraw = Some(idx);
                     }
                 }
                 _ => {}
             }
         }
 
-        if needs_redraw {
-            self.dirty = true;
-            if !self.frame_pending {
-                self.dirty = false;
-                self.draw(qh);
+        if let Some(idx) = pending_redraw {
+            self.overlays[idx].dirty = true;
+            if !self.overlays[idx].frame_pending {
+                self.overlays[idx].dirty = false;
+                self.redraw(idx, qh);
             }
         }
     }

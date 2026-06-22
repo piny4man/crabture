@@ -35,8 +35,12 @@ By default, graphical captures copy the image to your clipboard. You can switch 
 ### From crates.io
 
 ```sh
-cargo install crabture
+cargo install crabture --locked
 ```
+
+`--locked` installs against the dependency versions tested in `Cargo.lock`. It is
+recommended because `cargo install` otherwise re-resolves dependencies to their
+newest versions, which can pull in a release that fails to build.
 
 ### From source
 

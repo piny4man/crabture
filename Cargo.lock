@@ -646,7 +646,7 @@ dependencies = [
 
 [[package]]
 name = "crabture"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "ab_glyph",
  "anyhow",
