@@ -30,6 +30,8 @@ Crabture can capture screenshots in three main ways:
 
 By default, graphical captures copy the image to your clipboard. You can switch the graphical UI to save files or copy plus save, and those choices are remembered between runs.
 
+Optional shared [Swatches](https://crates.io/crates/swatches) themes live in a separate appearance file so capture preferences cannot overwrite them. See [Appearance](#appearance).
+
 ## Installation
 
 ### From crates.io
@@ -171,10 +173,43 @@ Direct capture commands save files by default. Add `--copy` to copy instead. If 
 - Multi-monitor: verify `FULL`/`F` captures the intended output and `--list-monitors` reports usable monitor identities.
 - Clipboard: verify copied images remain pasteable after the main `crabture` process exits.
 
+## Appearance
+
+Graphical colors and font are resolved once when the overlay opens. Edit `$XDG_CONFIG_HOME/crabture/appearance.toml` (typically `~/.config/crabture/appearance.toml`) and reopen crabture to apply changes. Capture output/mode/format/location stay in `$XDG_CONFIG_HOME/crabture/preferences` and are never rewritten by appearance loading.
+
+Without that file, crabture keeps the built-in dark toolbar palette and bundled Roboto Medium. An explicit `[appearance] theme_file` opts into a Swatches v1 theme. Relative paths resolve against the appearance file's directory; `~/` expands to `$HOME`.
+
+| Shared role | Crabture mapping |
+| --- | --- |
+| `colors.background` | Toolbar panel RGB (native panel alpha kept) |
+| `colors.foreground` | Toolbar text/icon RGB (role alpha kept); selection border |
+| `colors.accent` | Active mode, Capture action, window-highlight border/fill |
+| `colors.muted` | Secondary labels and shortcut hints |
+| `colors.selection_background` | Hover wash |
+| `colors.selection_foreground` | Text on accent actions |
+| `font.family` | Loaded via `fc-match` after an explicit `[font] path`; bundled Roboto if missing |
+
+Explicit `[colors]` / `[font]` fields always win, even when they equal an old default. Overlay dimming, radii, and spacing stay application-owned. A missing or invalid `theme_file` prints a warning to stderr and is ignored; crabture still opens and keeps valid overrides. Unknown keys in `appearance.toml` reject that file and fall back to the built-in appearance.
+
+```toml
+[appearance]
+theme_file = "~/themes/swatches.toml"
+
+# Optional per-app overrides:
+# [colors]
+# accent = "#80D4FF"
+# [font]
+# family = "JetBrainsMono Nerd Font Mono"
+# path = "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf"
+```
+
+The same resolved font is used for toolbar measurement, drawing, and pointer hit-testing.
+
 ## Architecture Notes
 
 - Capture intent flows through session commands for area, window, and full-screen targets before output handling, keeping capture selection separate from clipboard/file delivery.
 - Preferences are version-tolerant key/value data with safe defaults so stale configuration cannot prevent launch.
+- Appearance is loaded from a separate TOML file so saving capture preferences cannot clobber theme settings.
 - Markup and screen recording are intentionally future work. They should extend the session command/capture-result model rather than being coupled to the current still-image overlay paths.
 
 ## License

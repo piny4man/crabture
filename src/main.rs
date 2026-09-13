@@ -15,6 +15,7 @@ use std::{
 use time::OffsetDateTime;
 use xcap::{Monitor, Window};
 
+mod appearance;
 mod overlay;
 mod render;
 mod session;
@@ -256,6 +257,7 @@ fn cli_intent(cli: &Cli) -> CliIntent {
 
 fn run_graphical_screenshot_ui() -> Result<()> {
     let preferences = load_graphical_preferences().unwrap_or_default();
+    let appearance = load_runtime_appearance();
     let mut session = CaptureSession::with_preferences(preferences);
 
     // Freeze every output at physical resolution *before* showing the overlay.
@@ -269,7 +271,7 @@ fn run_graphical_screenshot_ui() -> Result<()> {
     // window mode.  Best-effort: an empty list just means no highlight.
     let window_rects = enumerate_window_rects();
 
-    let command = overlay::run_screenshot_hud(session.preferences(), window_rects)
+    let command = overlay::run_screenshot_hud(session.preferences(), window_rects, appearance)
         .context("graphical UI failed")?;
 
     match session.handle(command) {
@@ -325,6 +327,14 @@ fn graphical_save_dir(location: SaveLocationChoice) -> PathBuf {
             env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
         }
     }
+}
+
+fn load_runtime_appearance() -> appearance::Appearance {
+    let loaded = appearance::load_from_default_path();
+    for warning in loaded.warnings {
+        eprintln!("crabture: {warning}");
+    }
+    loaded.appearance
 }
 
 fn preferences_path() -> PathBuf {
@@ -561,7 +571,8 @@ fn select_area() -> Result<image::RgbaImage> {
     // 2. Run the Wayland layer-shell overlay for area selection.
     //    Returns (selection, surface_logical_size, output_name).
     let (selection, surf_size, output_name) =
-        overlay::run_selection_overlay().context("area selection failed")?;
+        overlay::run_selection_overlay(load_runtime_appearance())
+            .context("area selection failed")?;
 
     match selection {
         Some(rect) => selected_area_image(
@@ -2022,6 +2033,20 @@ mod tests {
         assert_eq!(
             parse_graphical_preferences(
                 "output=stale\nformat=png\nlocation=screenshots\nmode=area\n"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn appearance_fields_are_not_stored_in_capture_preferences() {
+        let serialized = serialize_graphical_preferences(&GraphicalPreferences::default());
+        assert!(!serialized.contains("theme"));
+        assert!(!serialized.contains("font"));
+        assert!(!serialized.contains("appearance"));
+        assert_eq!(
+            parse_graphical_preferences(
+                "theme_file=swatches.toml\noutput=clipboard\nformat=png\nlocation=screenshots\nmode=area\n"
             ),
             None
         );

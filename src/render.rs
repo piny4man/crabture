@@ -10,30 +10,15 @@
 //! onto the overlay's premultiplied **ARGB8888-LE** (BGRA byte order) wl_shm
 //! canvas.
 
+use crate::appearance::Appearance;
 use crate::session::SessionCommand;
 use crate::session::{CaptureMode, GraphicalPreferences, OutputDestination, SaveLocationChoice};
-use ab_glyph::{Font, FontRef, ScaleFont, point};
-use std::sync::OnceLock;
+use ab_glyph::{Font, FontVec, ScaleFont, point};
 use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, PixmapPaint, Transform};
 
 // ---------------------------------------------------------------------------
-// Theme (logical units; multiplied by `scale` at render time)
+// Geometry (logical units; multiplied by `scale` at render time)
 // ---------------------------------------------------------------------------
-
-/// Translucent dark panel material.
-const PANEL_FILL: (u8, u8, u8, u8) = (32, 32, 36, 236);
-/// Hairline panel border.
-const PANEL_BORDER: (u8, u8, u8, u8) = (255, 255, 255, 30);
-/// Thin separator between toolbar groups.
-const SEPARATOR: (u8, u8, u8, u8) = (255, 255, 255, 28);
-/// macOS-blue accent for the active mode and the Capture action.
-const ACCENT: (u8, u8, u8, u8) = (10, 132, 255, 255);
-/// Primary label colour.
-const TEXT: (u8, u8, u8, u8) = (255, 255, 255, 236);
-/// Secondary / muted label colour (categories, shortcut hints, caret).
-const TEXT_MUTED: (u8, u8, u8, u8) = (235, 235, 245, 150);
-/// Hover highlight behind a button.
-const HOVER: (u8, u8, u8, u8) = (255, 255, 255, 22);
 
 const BTN_H: f32 = 38.0;
 const PANEL_PAD_X: f32 = 8.0;
@@ -59,15 +44,9 @@ const PANEL_RADIUS: f32 = 13.0;
 
 const PANEL_H: f32 = BTN_H + 2.0 * PANEL_PAD_Y;
 
-const FONT_BYTES: &[u8] = include_bytes!("../assets/Roboto-Medium.ttf");
 const AREA_SVG: &[u8] = include_bytes!("../assets/area.svg");
 const WINDOW_SVG: &[u8] = include_bytes!("../assets/window.svg");
 const FULLSCREEN_SVG: &[u8] = include_bytes!("../assets/fullscreen.svg");
-
-fn font() -> &'static FontRef<'static> {
-    static FONT: OnceLock<FontRef<'static>> = OnceLock::new();
-    FONT.get_or_init(|| FontRef::try_from_slice(FONT_BYTES).expect("bundled Roboto font is valid"))
-}
 
 // ---------------------------------------------------------------------------
 // Layout model
@@ -112,8 +91,8 @@ pub struct ToolButton {
 }
 
 /// Measure the advance width of `text` at the given pixel size.
-fn text_width(text: &str, px: f32) -> f32 {
-    let scaled = font().as_scaled(px);
+fn text_width(font: &FontVec, text: &str, px: f32) -> f32 {
+    let scaled = font.as_scaled(px);
     text.chars()
         .map(|c| scaled.h_advance(scaled.glyph_id(c)))
         .sum()
@@ -134,30 +113,34 @@ fn location_value(location: SaveLocationChoice) -> &'static str {
     }
 }
 
-fn mode_width(label: &str, shortcut: char) -> f32 {
+fn mode_width(font: &FontVec, label: &str, shortcut: char) -> f32 {
     BTN_PAD_X
         + ICON
         + ICON_GAP
-        + text_width(label, LABEL_PX)
+        + text_width(font, label, LABEL_PX)
         + SHORT_GAP
-        + text_width(&shortcut.to_string(), SHORT_PX)
+        + text_width(font, &shortcut.to_string(), SHORT_PX)
         + BTN_PAD_X
 }
 
-fn chip_width(category: &str, value: &str, shortcut: char) -> f32 {
+fn chip_width(font: &FontVec, category: &str, value: &str, shortcut: char) -> f32 {
     BTN_PAD_X
-        + text_width(category, CAT_PX)
+        + text_width(font, category, CAT_PX)
         + CAT_VAL_GAP
-        + text_width(value, VAL_PX)
+        + text_width(font, value, VAL_PX)
         + VAL_CARET_GAP
         + CARET_W
         + SHORT_GAP
-        + text_width(&shortcut.to_string(), SHORT_PX)
+        + text_width(font, &shortcut.to_string(), SHORT_PX)
         + BTN_PAD_X
 }
 
-fn action_width(label: &str, hint: &str) -> f32 {
-    BTN_PAD_X + text_width(label, LABEL_PX) + HINT_GAP + text_width(hint, SHORT_PX) + BTN_PAD_X
+fn action_width(font: &FontVec, label: &str, hint: &str) -> f32 {
+    BTN_PAD_X
+        + text_width(font, label, LABEL_PX)
+        + HINT_GAP
+        + text_width(font, hint, SHORT_PX)
+        + BTN_PAD_X
 }
 
 /// Build the toolbar layout in logical surface coordinates.
@@ -165,11 +148,13 @@ pub fn toolbar_layout(
     surface_w: usize,
     surface_h: usize,
     prefs: GraphicalPreferences,
+    appearance: &Appearance,
 ) -> Vec<ToolButton> {
     if surface_w == 0 || surface_h == 0 {
         return Vec::new();
     }
 
+    let font = appearance.font();
     let output_val = output_value(prefs.output).to_string();
     let format_val = prefs.format.as_str().to_ascii_uppercase();
     let location_val = location_value(prefs.location).to_string();
@@ -183,7 +168,7 @@ pub fn toolbar_layout(
                 shortcut: 'A',
                 mode: CaptureMode::Area,
             };
-            let w = mode_width("Area", 'A');
+            let w = mode_width(font, "Area", 'A');
             (k, w, 0)
         },
         {
@@ -193,7 +178,7 @@ pub fn toolbar_layout(
                 shortcut: 'W',
                 mode: CaptureMode::Window,
             };
-            let w = mode_width("Window", 'W');
+            let w = mode_width(font, "Window", 'W');
             (k, w, 0)
         },
         {
@@ -203,11 +188,11 @@ pub fn toolbar_layout(
                 shortcut: 'F',
                 mode: CaptureMode::FullScreen,
             };
-            let w = mode_width("Full", 'F');
+            let w = mode_width(font, "Full", 'F');
             (k, w, 0)
         },
         {
-            let w = chip_width("Output", &output_val, 'O');
+            let w = chip_width(font, "Output", &output_val, 'O');
             let k = ToolKind::Chip {
                 category: "Output",
                 value: output_val,
@@ -216,7 +201,7 @@ pub fn toolbar_layout(
             (k, w, 1)
         },
         {
-            let w = chip_width("Format", &format_val, 'P');
+            let w = chip_width(font, "Format", &format_val, 'P');
             let k = ToolKind::Chip {
                 category: "Format",
                 value: format_val,
@@ -225,7 +210,7 @@ pub fn toolbar_layout(
             (k, w, 1)
         },
         {
-            let w = chip_width("Location", &location_val, 'L');
+            let w = chip_width(font, "Location", &location_val, 'L');
             let k = ToolKind::Chip {
                 category: "Location",
                 value: location_val,
@@ -239,7 +224,7 @@ pub fn toolbar_layout(
                 hint: "\u{23ce}",
                 accent: true,
             };
-            let w = action_width("Capture", "\u{23ce}");
+            let w = action_width(font, "Capture", "\u{23ce}");
             (k, w, 2)
         },
         {
@@ -248,7 +233,7 @@ pub fn toolbar_layout(
                 hint: "esc",
                 accent: false,
             };
-            let w = action_width("Cancel", "esc");
+            let w = action_width(font, "Cancel", "esc");
             (k, w, 2)
         },
     ];
@@ -412,8 +397,16 @@ fn blend_px(data: &mut [u8], idx: usize, r: u8, g: u8, b: u8, a: u8) {
 }
 
 /// Draw `text` with its left edge at `x` and baseline at `baseline`.
-fn draw_text(pm: &mut Pixmap, x: f32, baseline: f32, text: &str, px: f32, c: (u8, u8, u8, u8)) {
-    let f = font();
+fn draw_text(
+    pm: &mut Pixmap,
+    font: &FontVec,
+    x: f32,
+    baseline: f32,
+    text: &str,
+    px: f32,
+    c: (u8, u8, u8, u8),
+) {
+    let f = font;
     let scaled = f.as_scaled(px);
     let pw = pm.width() as i32;
     let ph = pm.height() as i32;
@@ -457,12 +450,13 @@ fn icon_bytes(icon: Icon) -> &'static [u8] {
     }
 }
 
-/// Rasterise a mode icon to a square white pixmap of `px` physical pixels.
-fn rasterize_icon(icon: Icon, px: u32) -> Option<Pixmap> {
+/// Rasterise a mode icon to a square pixmap of `px` physical pixels.
+fn rasterize_icon(icon: Icon, px: u32, rgb: (u8, u8, u8)) -> Option<Pixmap> {
     if px == 0 {
         return None;
     }
-    let svg = String::from_utf8_lossy(icon_bytes(icon)).replace("currentColor", "#ffffff");
+    let fill = format!("#{:02x}{:02x}{:02x}", rgb.0, rgb.1, rgb.2);
+    let svg = String::from_utf8_lossy(icon_bytes(icon)).replace("currentColor", &fill);
     let tree = usvg::Tree::from_data(svg.as_bytes(), &usvg::Options::default()).ok()?;
     let mut pm = Pixmap::new(px, px)?;
     let size = tree.size();
@@ -479,6 +473,7 @@ fn rasterize_icon(icon: Icon, px: u32) -> Option<Pixmap> {
 pub fn render_toolbar(
     layout: &[ToolButton],
     prefs: GraphicalPreferences,
+    appearance: &Appearance,
     scale: usize,
     hovered: Option<usize>,
 ) -> Option<(Pixmap, i32, i32)> {
@@ -501,6 +496,8 @@ pub fn render_toolbar(
     let lx = |v: f32| (v - ox) * scale;
     let ly = |v: f32| (v - oy) * scale;
 
+    let colors = &appearance.colors;
+
     // Panel background + hairline border.
     fill_round_rect(
         &mut pm,
@@ -509,7 +506,7 @@ pub fn render_toolbar(
         panel_w * scale,
         panel_h * scale,
         PANEL_RADIUS * scale,
-        PANEL_FILL,
+        colors.panel_fill,
     );
     if let Some(path) = round_rect_path(
         lx(panel_x) + 0.5 * scale,
@@ -524,7 +521,7 @@ pub fn render_toolbar(
         };
         pm.stroke_path(
             &path,
-            &solid_paint(PANEL_BORDER),
+            &solid_paint(colors.panel_border),
             &stroke,
             Transform::identity(),
             None,
@@ -538,7 +535,14 @@ pub fn render_toolbar(
             let sep_x = lx(gap_mid);
             let top = ly(first.rect.1 + 6.0);
             let bot = ly(first.rect.1 + BTN_H - 6.0);
-            fill_rect(&mut pm, sep_x, top, scale.max(1.0), bot - top, SEPARATOR);
+            fill_rect(
+                &mut pm,
+                sep_x,
+                top,
+                scale.max(1.0),
+                bot - top,
+                colors.separator,
+            );
         }
     }
 
@@ -549,6 +553,7 @@ pub fn render_toolbar(
             &mut pm,
             button,
             prefs,
+            appearance,
             scale,
             hovered,
             lx(bx),
@@ -570,6 +575,7 @@ fn render_button(
     pm: &mut Pixmap,
     button: &ToolButton,
     prefs: GraphicalPreferences,
+    appearance: &Appearance,
     scale: f32,
     hovered: bool,
     px: f32,
@@ -577,19 +583,20 @@ fn render_button(
     pw: f32,
     ph: f32,
 ) {
+    let colors = &appearance.colors;
+    let font = appearance.font();
     // Background: accent pill for the active mode / accent action, hover wash
     // otherwise.
     let active_mode = matches!(button.kind, ToolKind::Mode { mode, .. } if mode == prefs.mode);
     let accent_action = matches!(button.kind, ToolKind::Action { accent: true, .. });
     if active_mode || accent_action {
-        fill_round_rect(pm, px, py, pw, ph, BTN_RADIUS * scale, ACCENT);
+        fill_round_rect(pm, px, py, pw, ph, BTN_RADIUS * scale, colors.accent);
     } else if hovered {
-        fill_round_rect(pm, px, py, pw, ph, BTN_RADIUS * scale, HOVER);
+        fill_round_rect(pm, px, py, pw, ph, BTN_RADIUS * scale, colors.hover);
     }
 
     // Baseline: vertically centre text within the button.
-    let f = font();
-    let label_scaled = f.as_scaled(LABEL_PX * scale);
+    let label_scaled = font.as_scaled(LABEL_PX * scale);
     let baseline = py + ph / 2.0 + (label_scaled.ascent() + label_scaled.descent()) / 2.0;
 
     match &button.kind {
@@ -602,7 +609,7 @@ fn render_button(
             let icon_px = (ICON * scale).round() as u32;
             let icon_y = py + (ph - ICON * scale) / 2.0;
             let icon_x = px + BTN_PAD_X * scale;
-            if let Some(icon_pm) = rasterize_icon(*icon, icon_px) {
+            if let Some(icon_pm) = rasterize_icon(*icon, icon_px, colors.icon) {
                 let opacity = if active_mode { 1.0 } else { 0.82 };
                 pm.draw_pixmap(
                     icon_x.round() as i32,
@@ -618,12 +625,25 @@ fn render_button(
                 );
             }
             let label_x = icon_x + ICON * scale + ICON_GAP * scale;
-            draw_text(pm, label_x, baseline, label, LABEL_PX * scale, TEXT);
-            let label_w = text_width(label, LABEL_PX) * scale;
-            let short_x = label_x + label_w + SHORT_GAP * scale;
-            let short_color = if active_mode { TEXT } else { TEXT_MUTED };
             draw_text(
                 pm,
+                font,
+                label_x,
+                baseline,
+                label,
+                LABEL_PX * scale,
+                colors.text,
+            );
+            let label_w = text_width(font, label, LABEL_PX) * scale;
+            let short_x = label_x + label_w + SHORT_GAP * scale;
+            let short_color = if active_mode {
+                colors.text
+            } else {
+                colors.text_muted
+            };
+            draw_text(
+                pm,
+                font,
                 short_x,
                 baseline,
                 &shortcut.to_string(),
@@ -637,22 +657,39 @@ fn render_button(
             shortcut,
         } => {
             let cat_x = px + BTN_PAD_X * scale;
-            draw_text(pm, cat_x, baseline, category, CAT_PX * scale, TEXT_MUTED);
-            let cat_w = text_width(category, CAT_PX) * scale;
+            draw_text(
+                pm,
+                font,
+                cat_x,
+                baseline,
+                category,
+                CAT_PX * scale,
+                colors.text_muted,
+            );
+            let cat_w = text_width(font, category, CAT_PX) * scale;
             let val_x = cat_x + cat_w + CAT_VAL_GAP * scale;
-            draw_text(pm, val_x, baseline, value, VAL_PX * scale, TEXT);
-            let val_w = text_width(value, VAL_PX) * scale;
+            draw_text(
+                pm,
+                font,
+                val_x,
+                baseline,
+                value,
+                VAL_PX * scale,
+                colors.text,
+            );
+            let val_w = text_width(font, value, VAL_PX) * scale;
             let caret_x = val_x + val_w + VAL_CARET_GAP * scale;
             let caret_y = py + ph / 2.0 - (CARET_H * scale) / 2.0 + scale;
-            fill_caret(pm, caret_x, caret_y, TEXT_MUTED);
+            fill_caret(pm, caret_x, caret_y, colors.text_muted);
             let short_x = caret_x + CARET_W * scale + SHORT_GAP * scale;
             draw_text(
                 pm,
+                font,
                 short_x,
                 baseline,
                 &shortcut.to_string(),
                 SHORT_PX * scale,
-                TEXT_MUTED,
+                colors.text_muted,
             );
         }
         ToolKind::Action {
@@ -661,16 +698,36 @@ fn render_button(
             accent,
         } => {
             let label_x = px + BTN_PAD_X * scale;
-            let label_color = if *accent { (255, 255, 255, 255) } else { TEXT };
-            draw_text(pm, label_x, baseline, label, LABEL_PX * scale, label_color);
-            let label_w = text_width(label, LABEL_PX) * scale;
+            let label_color = if *accent {
+                colors.accent_label
+            } else {
+                colors.text
+            };
+            draw_text(
+                pm,
+                font,
+                label_x,
+                baseline,
+                label,
+                LABEL_PX * scale,
+                label_color,
+            );
+            let label_w = text_width(font, label, LABEL_PX) * scale;
             let hint_x = label_x + label_w + HINT_GAP * scale;
             let hint_color = if *accent {
-                (255, 255, 255, 200)
+                colors.accent_hint
             } else {
-                TEXT_MUTED
+                colors.text_muted
             };
-            draw_text(pm, hint_x, baseline, hint, SHORT_PX * scale, hint_color);
+            draw_text(
+                pm,
+                font,
+                hint_x,
+                baseline,
+                hint,
+                SHORT_PX * scale,
+                hint_color,
+            );
         }
     }
 }
@@ -729,6 +786,10 @@ mod tests {
         GraphicalPreferences::default()
     }
 
+    fn appearance() -> Appearance {
+        Appearance::bundled()
+    }
+
     #[test]
     fn packs_argb_little_endian() {
         assert_eq!(pack_argb(0x99, 0x11, 0x22, 0x33), 0x99_11_22_33);
@@ -765,7 +826,7 @@ mod tests {
 
     #[test]
     fn layout_emits_expected_commands_in_order() {
-        let layout = toolbar_layout(1920, 1080, prefs());
+        let layout = toolbar_layout(1920, 1080, prefs(), &appearance());
         assert_eq!(layout.len(), 8);
         assert_eq!(
             layout[0].command,
@@ -785,12 +846,12 @@ mod tests {
 
     #[test]
     fn layout_is_empty_for_zero_sized_surface() {
-        assert!(toolbar_layout(0, 0, prefs()).is_empty());
+        assert!(toolbar_layout(0, 0, prefs(), &appearance()).is_empty());
     }
 
     #[test]
     fn buttons_are_left_to_right_and_non_overlapping() {
-        let layout = toolbar_layout(1920, 1080, prefs());
+        let layout = toolbar_layout(1920, 1080, prefs(), &appearance());
         for pair in layout.windows(2) {
             let a_right = pair[0].rect.0 + pair[0].rect.2;
             assert!(pair[1].rect.0 >= a_right, "buttons must not overlap");
@@ -799,7 +860,7 @@ mod tests {
 
     #[test]
     fn button_at_hits_each_button_center() {
-        let layout = toolbar_layout(1920, 1080, prefs());
+        let layout = toolbar_layout(1920, 1080, prefs(), &appearance());
         for (i, b) in layout.iter().enumerate() {
             let cx = (b.rect.0 + b.rect.2 / 2.0) as f64;
             let cy = (b.rect.1 + b.rect.3 / 2.0) as f64;
@@ -836,8 +897,10 @@ mod tests {
                             location,
                             mode,
                         };
-                        let layout = toolbar_layout(1920, 1080, p);
-                        let (pm, ox, oy) = render_toolbar(&layout, p, 2, None).unwrap();
+                        let appearance = appearance();
+                        let layout = toolbar_layout(1920, 1080, p, &appearance);
+                        let (pm, ox, oy) =
+                            render_toolbar(&layout, p, &appearance, 2, None).unwrap();
                         assert!(pm.width() > 0 && pm.height() > 0);
                         assert!(ox >= 0 && oy >= 0);
                         // Some pixels must be painted (panel is opaque-ish).
@@ -850,11 +913,65 @@ mod tests {
 
     #[test]
     fn render_toolbar_scales_pixmap_with_buffer_scale() {
-        let layout = toolbar_layout(1920, 1080, prefs());
-        let (p1, _, _) = render_toolbar(&layout, prefs(), 1, None).unwrap();
-        let (p2, _, _) = render_toolbar(&layout, prefs(), 2, None).unwrap();
+        let appearance = appearance();
+        let layout = toolbar_layout(1920, 1080, prefs(), &appearance);
+        let (p1, _, _) = render_toolbar(&layout, prefs(), &appearance, 1, None).unwrap();
+        let (p2, _, _) = render_toolbar(&layout, prefs(), &appearance, 2, None).unwrap();
         // Doubling the scale roughly doubles each dimension.
         assert!(p2.width() >= p1.width() * 2 - 2);
         assert!(p2.height() >= p1.height() * 2 - 2);
+    }
+
+    #[test]
+    fn themed_appearance_changes_toolbar_pixels() {
+        let dir =
+            std::env::temp_dir().join(format!("crabture-render-theme-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("theme.toml"),
+            r##"
+version = 1
+
+[colors]
+background = "#10253F"
+foreground = "#EAF3FF"
+accent = "#80D4FF"
+muted = "#A4B8CF"
+selection_background = "#244A70"
+selection_foreground = "#FFFFFF"
+
+[font]
+family = "JetBrainsMono Nerd Font Mono"
+"##,
+        )
+        .unwrap();
+        let themed = crate::appearance::resolve_from_toml(
+            "[appearance]\ntheme_file = \"theme.toml\"\n",
+            Some(&dir),
+            None,
+        )
+        .unwrap()
+        .appearance;
+        let default = appearance();
+        let default_layout = toolbar_layout(1920, 1080, prefs(), &default);
+        let themed_layout = toolbar_layout(1920, 1080, prefs(), &themed);
+        let (pm_default, _, _) =
+            render_toolbar(&default_layout, prefs(), &default, 1, None).unwrap();
+        let (pm_themed, _, _) = render_toolbar(&themed_layout, prefs(), &themed, 1, None).unwrap();
+        assert_ne!(pm_default.data(), pm_themed.data());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hit_testing_uses_the_same_font_as_layout() {
+        let appearance = appearance();
+        let layout = toolbar_layout(1920, 1080, prefs(), &appearance);
+        for (i, button) in layout.iter().enumerate() {
+            let cx = (button.rect.0 + button.rect.2 / 2.0) as f64;
+            let cy = (button.rect.1 + button.rect.3 / 2.0) as f64;
+            assert_eq!(button_at(&layout, cx, cy), Some(i));
+        }
+        let (pm, _, _) = render_toolbar(&layout, prefs(), &appearance, 2, None).unwrap();
+        assert!(pm.width() > 0 && pm.height() > 0);
     }
 }

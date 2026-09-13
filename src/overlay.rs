@@ -6,6 +6,7 @@
 //! border so the user can see the content underneath.
 //! Pointer click-drag selects the area; Escape or right-click cancels.
 
+use crate::appearance::{Appearance, ColorSet, FontKey};
 use crate::render;
 use crate::session::{
     AreaSelection, CaptureMode, FullScreenSelection, GraphicalPreferences, SessionCommand,
@@ -44,19 +45,8 @@ use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::
     Shape, WpCursorShapeDeviceV1,
 };
 
-/// Dark overlay: premultiplied ARGB, ~60% opacity black.
-/// In ARGB8888 little-endian (BGRA byte order): B=0, G=0, R=0, A=0x99.
-const OVERLAY_PIXEL: u32 = 0x9900_0000;
 /// Selection area: fully transparent so desktop shows through.
 const CLEAR_PIXEL: u32 = 0x0000_0000;
-/// Border: solid white, premultiplied.
-const BORDER_PIXEL: u32 = 0xFFFF_FFFF;
-/// Window-highlight fill: accent blue (10,132,255) at ~22% opacity,
-/// premultiplied ARGB8888-LE.  Composited over the desktop so the hovered
-/// window gets a translucent blue tint.
-const HIGHLIGHT_FILL_PIXEL: u32 = 0x3802_1D38;
-/// Window-highlight border: solid accent blue, premultiplied ARGB8888-LE.
-const HIGHLIGHT_BORDER_PIXEL: u32 = 0xFF0A_84FF;
 
 /// A rectangle in logical surface coordinates: (x, y, width, height).
 pub type SelectionRect = (u32, u32, u32, u32);
@@ -313,7 +303,7 @@ fn shortcut_session_command(
 /// `selection` is `Some((x, y, w, h))` in logical surface coordinates, or
 /// `None` if cancelled.  `output_name` identifies which monitor the overlay
 /// appeared on (e.g. `"eDP-1"`).
-pub fn run_selection_overlay() -> Result<OverlayResult> {
+pub fn run_selection_overlay(appearance: Appearance) -> Result<OverlayResult> {
     let conn = Connection::connect_to_env().context("failed to connect to Wayland")?;
     let (globals, mut event_queue) =
         registry_queue_init(&conn).context("failed to initialise Wayland registry")?;
@@ -342,6 +332,7 @@ pub fn run_selection_overlay() -> Result<OverlayResult> {
         window_rects: Vec::new(),
         hud_active: false,
         preferences: GraphicalPreferences::default(),
+        appearance,
         hud_result: None,
         selection_result: None,
         exit: false,
@@ -381,6 +372,7 @@ pub fn run_selection_overlay() -> Result<OverlayResult> {
 pub fn run_screenshot_hud(
     default_preferences: GraphicalPreferences,
     window_rects: Vec<(i32, i32, u32, u32)>,
+    appearance: Appearance,
 ) -> Result<SessionCommand> {
     let conn = Connection::connect_to_env().context("failed to connect to Wayland")?;
     let (globals, mut event_queue) =
@@ -408,6 +400,7 @@ pub fn run_screenshot_hud(
         window_rects,
         hud_active: true,
         preferences: default_preferences,
+        appearance,
         hud_result: None,
         selection_result: None,
         exit: false,
@@ -457,6 +450,8 @@ fn teardown_layer_surface(conn: &Connection, layer: &LayerSurface) {
 /// affecting the toolbar changes.
 struct ToolbarCache {
     prefs: GraphicalPreferences,
+    colors: ColorSet,
+    font_key: FontKey,
     scale: usize,
     hovered: Option<usize>,
     lw: usize,
@@ -538,6 +533,7 @@ struct OverlayState {
 
     hud_active: bool,
     preferences: GraphicalPreferences,
+    appearance: Appearance,
     /// Result of the HUD session (capture command or cancel).
     hud_result: Option<SessionCommand>,
     /// Result of the legacy `--select` overlay: the completed selection, its
@@ -665,9 +661,10 @@ impl OverlayState {
         let is_active = self.active_index() == Some(idx);
         let shm = &self.shm;
         let preferences = self.preferences;
+        let appearance = &self.appearance;
         let hud_active = self.hud_active;
         if let Some(ov) = self.overlays.get_mut(idx) {
-            ov.draw(qh, shm, preferences, hud_active, is_active);
+            ov.draw(qh, shm, preferences, appearance, hud_active, is_active);
         }
     }
 
@@ -746,11 +743,18 @@ impl OverlayState {
 impl OutputOverlay {
     /// Recompute which toolbar button is under the pointer.  Returns `true`
     /// when the hovered button changed so the caller can trigger a redraw.
-    fn update_hover(&mut self, lx: f64, ly: f64, preferences: GraphicalPreferences) -> bool {
+    fn update_hover(
+        &mut self,
+        lx: f64,
+        ly: f64,
+        preferences: GraphicalPreferences,
+        appearance: &Appearance,
+    ) -> bool {
         let layout = render::toolbar_layout(
             self.surface_w as usize,
             self.surface_h as usize,
             preferences,
+            appearance,
         );
         let hovered = render::button_at(&layout, lx, ly);
         if hovered != self.hovered_button {
@@ -788,6 +792,7 @@ impl OutputOverlay {
         qh: &QueueHandle<OverlayState>,
         shm: &Shm,
         preferences: GraphicalPreferences,
+        appearance: &Appearance,
         hud_active: bool,
         is_active: bool,
     ) {
@@ -827,9 +832,9 @@ impl OutputOverlay {
             unsafe { std::slice::from_raw_parts_mut(canvas.as_mut_ptr() as *mut u32, pw * ph) };
 
         if hud_active {
-            self.draw_hud(pixels, lw, lh, scale, preferences, is_active);
+            self.draw_hud(pixels, lw, lh, scale, preferences, appearance, is_active);
         } else {
-            pixels.fill(OVERLAY_PIXEL);
+            pixels.fill(appearance.colors.overlay);
             draw_selection(
                 pixels,
                 pw,
@@ -837,6 +842,7 @@ impl OutputOverlay {
                 scaled_point(self.start, scale),
                 scaled_point(self.current, scale),
                 scaled_rect(self.selection, scale),
+                appearance.colors.selection_border,
             );
         }
 
@@ -866,6 +872,7 @@ impl OutputOverlay {
         self.layer.commit();
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_hud(
         &mut self,
         pixels: &mut [u32],
@@ -873,12 +880,14 @@ impl OutputOverlay {
         lh: usize,
         scale: usize,
         preferences: GraphicalPreferences,
+        appearance: &Appearance,
         is_active: bool,
     ) {
         let pw = lw * scale;
         let ph = lh * scale;
+        let colors = appearance.colors;
         if preferences.mode == CaptureMode::Area {
-            pixels.fill(OVERLAY_PIXEL);
+            pixels.fill(colors.overlay);
             draw_selection(
                 pixels,
                 pw,
@@ -886,11 +895,20 @@ impl OutputOverlay {
                 scaled_point(self.start, scale),
                 scaled_point(self.current, scale),
                 scaled_rect(self.selection, scale),
+                colors.selection_border,
             );
         } else if preferences.mode == CaptureMode::Window {
             pixels.fill(CLEAR_PIXEL);
             if let Some(rect) = self.highlighted_window {
-                draw_window_highlight(pixels, pw, ph, rect, scale);
+                draw_window_highlight(
+                    pixels,
+                    pw,
+                    ph,
+                    rect,
+                    scale,
+                    colors.highlight_fill,
+                    colors.highlight_border,
+                );
             } else if let Some(point) = self.window_target {
                 draw_window_target(
                     pixels,
@@ -898,6 +916,7 @@ impl OutputOverlay {
                     ph,
                     (point.0 as usize * scale, point.1 as usize * scale),
                     scale,
+                    colors.selection_border,
                 );
             }
         } else {
@@ -919,26 +938,34 @@ impl OutputOverlay {
         // buffer resolution.
         let cache_hit = self.toolbar_cache.as_ref().is_some_and(|c| {
             c.prefs == preferences
+                && c.colors == colors
+                && c.font_key == *appearance.font_key()
                 && c.scale == scale
                 && c.hovered == self.hovered_button
                 && c.lw == lw
                 && c.lh == lh
         });
         if !cache_hit {
-            let layout = render::toolbar_layout(lw, lh, preferences);
-            self.toolbar_cache =
-                render::render_toolbar(&layout, preferences, scale, self.hovered_button).map(
-                    |(pixmap, ox, oy)| ToolbarCache {
-                        prefs: preferences,
-                        scale,
-                        hovered: self.hovered_button,
-                        lw,
-                        lh,
-                        pixmap,
-                        ox,
-                        oy,
-                    },
-                );
+            let layout = render::toolbar_layout(lw, lh, preferences, appearance);
+            self.toolbar_cache = render::render_toolbar(
+                &layout,
+                preferences,
+                appearance,
+                scale,
+                self.hovered_button,
+            )
+            .map(|(pixmap, ox, oy)| ToolbarCache {
+                prefs: preferences,
+                colors,
+                font_key: appearance.font_key().clone(),
+                scale,
+                hovered: self.hovered_button,
+                lw,
+                lh,
+                pixmap,
+                ox,
+                oy,
+            });
         }
         if let Some(c) = &self.toolbar_cache {
             render::blit_argb(pixels, pw, ph, &c.pixmap, c.ox, c.oy);
@@ -988,6 +1015,8 @@ fn draw_window_highlight(
     h: usize,
     rect: (i32, i32, u32, u32),
     scale: usize,
+    fill: u32,
+    border: u32,
 ) {
     let s = scale as i32;
     let left = (rect.0 * s).clamp(0, w as i32);
@@ -1002,32 +1031,39 @@ fn draw_window_highlight(
     for y in top..bottom {
         let row = y * w;
         for px in &mut pixels[row + left..row + right] {
-            *px = HIGHLIGHT_FILL_PIXEL;
+            *px = fill;
         }
     }
 
-    let border = scale.max(1) * 2;
+    let thickness = scale.max(1) * 2;
     for y in top..bottom {
         let row = y * w;
-        let on_h_edge = y < top + border || y >= bottom.saturating_sub(border);
+        let on_h_edge = y < top + thickness || y >= bottom.saturating_sub(thickness);
         if on_h_edge {
             for px in &mut pixels[row + left..row + right] {
-                *px = HIGHLIGHT_BORDER_PIXEL;
+                *px = border;
             }
         } else {
-            let left_edge = (left + border).min(right);
+            let left_edge = (left + thickness).min(right);
             for px in &mut pixels[row + left..row + left_edge] {
-                *px = HIGHLIGHT_BORDER_PIXEL;
+                *px = border;
             }
-            let right_edge = right.saturating_sub(border).max(left);
+            let right_edge = right.saturating_sub(thickness).max(left);
             for px in &mut pixels[row + right_edge..row + right] {
-                *px = HIGHLIGHT_BORDER_PIXEL;
+                *px = border;
             }
         }
     }
 }
 
-fn draw_window_target(pixels: &mut [u32], w: usize, h: usize, point: (usize, usize), scale: usize) {
+fn draw_window_target(
+    pixels: &mut [u32],
+    w: usize,
+    h: usize,
+    point: (usize, usize),
+    scale: usize,
+    color: u32,
+) {
     let cx = point.0;
     let cy = point.1;
     let radius = 18usize * scale;
@@ -1036,14 +1072,14 @@ fn draw_window_target(pixels: &mut [u32], w: usize, h: usize, point: (usize, usi
         let left = cx.saturating_sub(radius);
         let right = (cx + radius + 1).min(w);
         for x in left..right {
-            pixels[cy * w + x] = BORDER_PIXEL;
+            pixels[cy * w + x] = color;
         }
     }
     if cx < w {
         let top = cy.saturating_sub(radius);
         let bottom = (cy + radius + 1).min(h);
         for y in top..bottom {
-            pixels[y * w + cx] = BORDER_PIXEL;
+            pixels[y * w + cx] = color;
         }
     }
 }
@@ -1055,6 +1091,7 @@ fn draw_selection(
     start: Option<(f64, f64)>,
     current: Option<(f64, f64)>,
     selection: Option<SelectionRect>,
+    border: u32,
 ) {
     let rect = if let (Some(start), Some(cur)) = (start, current) {
         Some(selection_rect_from_drag(start, cur))
@@ -1077,18 +1114,18 @@ fn draw_selection(
 
             let top_start = y1 * w + x1;
             let top_end = y1 * w + x2;
-            pixels[top_start..top_end].fill(BORDER_PIXEL);
+            pixels[top_start..top_end].fill(border);
 
             if y2 > y1 + 1 {
                 let bot_start = (y2 - 1) * w + x1;
                 let bot_end = (y2 - 1) * w + x2;
-                pixels[bot_start..bot_end].fill(BORDER_PIXEL);
+                pixels[bot_start..bot_end].fill(border);
             }
 
             for row in y1..y2 {
-                pixels[row * w + x1] = BORDER_PIXEL;
+                pixels[row * w + x1] = border;
                 if x2 > x1 + 1 {
-                    pixels[row * w + x2 - 1] = BORDER_PIXEL;
+                    pixels[row * w + x2 - 1] = border;
                 }
             }
         }
@@ -1463,6 +1500,7 @@ impl PointerHandler for OverlayState {
                                 self.overlays[idx].surface_w as usize,
                                 self.overlays[idx].surface_h as usize,
                                 self.preferences,
+                                &self.appearance,
                             );
                             if let Some(button_idx) = render::button_at(&layout, lx, ly) {
                                 let command = layout.swap_remove(button_idx).command;
@@ -1603,7 +1641,7 @@ impl PointerHandler for OverlayState {
                 PointerEventKind::Motion { .. } if self.hud_active => {
                     let preferences = self.preferences;
                     let mut changed = false;
-                    if self.overlays[idx].update_hover(lx, ly, preferences) {
+                    if self.overlays[idx].update_hover(lx, ly, preferences, &self.appearance) {
                         changed = true;
                     }
                     if preferences.mode == CaptureMode::Window {
@@ -1852,14 +1890,24 @@ mod tests {
     }
 
     #[test]
+    fn built_in_appearance_matches_legacy_overlay_pixels() {
+        let colors = ColorSet::built_in();
+        assert_eq!(colors.overlay, 0x9900_0000);
+        assert_eq!(colors.selection_border, 0xFFFF_FFFF);
+        assert_eq!(colors.highlight_fill, 0x3802_1D38);
+        assert_eq!(colors.highlight_border, 0xFF0A_84FF);
+    }
+
+    #[test]
     fn draws_window_target_marker() {
         let mut pixels = vec![CLEAR_PIXEL; 20 * 20];
+        let border = ColorSet::built_in().selection_border;
 
-        draw_window_target(&mut pixels, 20, 20, (10, 10), 1);
+        draw_window_target(&mut pixels, 20, 20, (10, 10), 1, border);
 
-        assert_eq!(pixels[10 * 20 + 10], BORDER_PIXEL);
-        assert_eq!(pixels[10 * 20], BORDER_PIXEL);
-        assert_eq!(pixels[10], BORDER_PIXEL);
+        assert_eq!(pixels[10 * 20 + 10], border);
+        assert_eq!(pixels[10 * 20], border);
+        assert_eq!(pixels[10], border);
     }
 
     #[test]
@@ -1876,14 +1924,15 @@ mod tests {
         // At scale 2 the marker is drawn in a physical-resolution buffer.
         let mut pixels = vec![CLEAR_PIXEL; 40 * 40];
 
-        draw_window_target(&mut pixels, 40, 40, (20, 20), 2);
+        let border = ColorSet::built_in().selection_border;
+        draw_window_target(&mut pixels, 40, 40, (20, 20), 2, border);
 
         // Centre crosshair lands at the scaled point.
-        assert_eq!(pixels[20 * 40 + 20], BORDER_PIXEL);
+        assert_eq!(pixels[20 * 40 + 20], border);
         // The crosshair arms reach 18*scale=36 pixels out, clamped to the
         // buffer edges without overflowing.
-        assert_eq!(pixels[20 * 40], BORDER_PIXEL);
-        assert_eq!(pixels[20 * 40 + 39], BORDER_PIXEL);
+        assert_eq!(pixels[20 * 40], border);
+        assert_eq!(pixels[20 * 40 + 39], border);
     }
 
     #[test]
@@ -1921,12 +1970,21 @@ mod tests {
     fn draws_window_highlight_fill_and_border() {
         let mut pixels = vec![CLEAR_PIXEL; 40 * 40];
 
-        draw_window_highlight(&mut pixels, 40, 40, (10, 10, 20, 20), 1);
+        let colors = ColorSet::built_in();
+        draw_window_highlight(
+            &mut pixels,
+            40,
+            40,
+            (10, 10, 20, 20),
+            1,
+            colors.highlight_fill,
+            colors.highlight_border,
+        );
 
         // Interior is the translucent fill.
-        assert_eq!(pixels[20 * 40 + 20], HIGHLIGHT_FILL_PIXEL);
+        assert_eq!(pixels[20 * 40 + 20], colors.highlight_fill);
         // The top-left corner of the rect is on the solid border.
-        assert_eq!(pixels[10 * 40 + 10], HIGHLIGHT_BORDER_PIXEL);
+        assert_eq!(pixels[10 * 40 + 10], colors.highlight_border);
         // Outside the rect stays untouched.
         assert_eq!(pixels[5 * 40 + 5], CLEAR_PIXEL);
     }
@@ -1937,11 +1995,20 @@ mod tests {
         // and beyond the right/bottom is clipped without panicking.
         let mut pixels = vec![CLEAR_PIXEL; 20 * 20];
 
-        draw_window_highlight(&mut pixels, 20, 20, (-10, -10, 40, 40), 1);
+        let colors = ColorSet::built_in();
+        draw_window_highlight(
+            &mut pixels,
+            20,
+            20,
+            (-10, -10, 40, 40),
+            1,
+            colors.highlight_fill,
+            colors.highlight_border,
+        );
 
         // The visible portion is filled (border within the first rows/cols).
-        assert_eq!(pixels[0], HIGHLIGHT_BORDER_PIXEL);
-        assert_eq!(pixels[10 * 20 + 10], HIGHLIGHT_FILL_PIXEL);
+        assert_eq!(pixels[0], colors.highlight_border);
+        assert_eq!(pixels[10 * 20 + 10], colors.highlight_fill);
     }
 
     #[test]

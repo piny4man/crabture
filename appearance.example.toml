@@ -1,0 +1,34 @@
+# Optional shared appearance for the graphical overlay.
+# Copy to $XDG_CONFIG_HOME/crabture/appearance.toml (typically
+# ~/.config/crabture/appearance.toml). Capture output preferences stay in
+# $XDG_CONFIG_HOME/crabture/preferences and are never rewritten from here.
+#
+# Omit this file (the default) to keep crabture's built-in dark toolbar and
+# bundled Roboto Medium. Theme edits apply the next time the overlay opens.
+
+# [appearance]
+# theme_file = "theme.toml"
+# theme_file = "~/themes/swatches.toml"
+
+# Mapping from the six Swatches roles:
+#   background            → toolbar panel RGB (native panel alpha kept)
+#   foreground            → toolbar text/icon RGB; selection border
+#   accent                → active mode, Capture, window highlight
+#   muted                 → secondary labels and shortcut hints
+#   selection_background  → hover wash
+#   selection_foreground  → text on accent actions
+#   font.family           → fc-match after an explicit [font] path
+#
+# Explicit fields below always win over the shared theme.
+
+# [colors]
+# background = "#10253F"
+# foreground = "#EAF3FF"
+# accent = "#80D4FF"
+# muted = "#A4B8CF"
+# selection_background = "#244A70"
+# selection_foreground = "#FFFFFF"
+
+# [font]
+# family = "JetBrainsMono Nerd Font Mono"
+# path = "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf"
