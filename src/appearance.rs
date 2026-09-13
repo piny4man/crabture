@@ -1,9 +1,10 @@
 //! Resolved HUD appearance, loaded separately from capture preferences.
 //!
-//! Defaults match the previous hardcoded toolbar/overlay palette. An optional
-//! Swatches theme replaces the six semantic RGB roles; explicit `[colors]` /
-//! `[font]` fields in `$XDG_CONFIG_HOME/crabture/appearance.toml` always win.
-//! Alpha, geometry, and the overlay dim fill stay application-owned.
+//! The no-theme palette is the previous hardcoded toolbar/overlay look and is
+//! kept explicitly. An optional Swatches theme replaces the six semantic RGB
+//! roles; explicit `[colors]` / `[font]` fields in
+//! `$XDG_CONFIG_HOME/crabture/appearance.toml` always win. Alpha, geometry,
+//! overlay dimming, and Capture's on-accent contrast stay application-owned.
 
 use ab_glyph::FontVec;
 use serde::Deserialize;
@@ -37,6 +38,9 @@ pub struct ColorSet {
     pub text_muted: (u8, u8, u8, u8),
     pub hover: (u8, u8, u8, u8),
     pub icon: (u8, u8, u8),
+    pub selected: (u8, u8, u8, u8),
+    pub selected_label: (u8, u8, u8, u8),
+    pub selected_icon: (u8, u8, u8),
     pub accent_label: (u8, u8, u8, u8),
     pub accent_hint: (u8, u8, u8, u8),
     pub overlay: u32,
@@ -46,9 +50,32 @@ pub struct ColorSet {
 }
 
 impl ColorSet {
-    /// Palette used when no theme or appearance file is selected.
+    /// Palette used when no theme or color overrides are selected.
     pub fn built_in() -> Self {
-        from_shared(&built_in_shared())
+        Self {
+            panel_fill: (32, 32, 36, PANEL_FILL_ALPHA),
+            panel_border: (255, 255, 255, PANEL_BORDER_ALPHA),
+            separator: (255, 255, 255, SEPARATOR_ALPHA),
+            accent: (10, 132, 255, 255),
+            text: (255, 255, 255, TEXT_ALPHA),
+            text_muted: (235, 235, 245, MUTED_ALPHA),
+            hover: (255, 255, 255, HOVER_ALPHA),
+            icon: (255, 255, 255),
+            selected: (10, 132, 255, 255),
+            selected_label: (255, 255, 255, 255),
+            selected_icon: (255, 255, 255),
+            accent_label: (255, 255, 255, 255),
+            accent_hint: (255, 255, 255, ACCENT_HINT_ALPHA),
+            overlay: OVERLAY_PIXEL,
+            selection_border: pack_argb(255, 255, 255, 255),
+            highlight_fill: pack_argb(
+                HIGHLIGHT_FILL_ALPHA,
+                premul(10, HIGHLIGHT_FILL_ALPHA),
+                premul(132, HIGHLIGHT_FILL_ALPHA),
+                premul(255, HIGHLIGHT_FILL_ALPHA),
+            ),
+            highlight_border: pack_argb(255, 10, 132, 255),
+        }
     }
 }
 
@@ -228,13 +255,27 @@ pub fn resolve_from_toml(
     } else {
         None
     };
+    let colors = if theme.is_none() && !patch_has_colors(&patch) {
+        ColorSet::built_in()
+    } else {
+        from_shared(&shared)
+    };
     Ok(LoadedAppearance {
         appearance: Appearance {
-            colors: from_shared(&shared),
+            colors,
             font: load_font(font_path.as_deref(), family),
         },
         warnings,
     })
+}
+
+fn patch_has_colors(patch: &AppearancePatch) -> bool {
+    patch.background.is_some()
+        || patch.foreground.is_some()
+        || patch.accent.is_some()
+        || patch.muted.is_some()
+        || patch.selection_background.is_some()
+        || patch.selection_foreground.is_some()
 }
 
 fn appearance_patch(raw: &RawFile) -> Result<AppearancePatch, AppearanceError> {
@@ -322,7 +363,7 @@ fn built_in_shared() -> SharedAppearance {
         foreground: Rgb::new(255, 255, 255),
         accent: Rgb::new(10, 132, 255),
         muted: Rgb::new(235, 235, 245),
-        selection_background: Rgb::new(255, 255, 255),
+        selection_background: Rgb::new(10, 132, 255),
         selection_foreground: Rgb::new(255, 255, 255),
         font_family: "Roboto".parse().expect("built-in family is valid"),
     }
@@ -335,6 +376,7 @@ fn from_shared(shared: &SharedAppearance) -> ColorSet {
     let [mr, mg, mb] = shared.muted.channels();
     let [sr, sg, sb] = shared.selection_background.channels();
     let [lr, lg, lb] = shared.selection_foreground.channels();
+    let (cr, cg, cb) = contrasting_rgb(ar, ag, ab);
     ColorSet {
         panel_fill: (br, bg, bb, PANEL_FILL_ALPHA),
         panel_border: (fr, fg, fb, PANEL_BORDER_ALPHA),
@@ -344,8 +386,11 @@ fn from_shared(shared: &SharedAppearance) -> ColorSet {
         text_muted: (mr, mg, mb, MUTED_ALPHA),
         hover: (sr, sg, sb, HOVER_ALPHA),
         icon: (fr, fg, fb),
-        accent_label: (lr, lg, lb, 255),
-        accent_hint: (lr, lg, lb, ACCENT_HINT_ALPHA),
+        selected: (sr, sg, sb, 255),
+        selected_label: (lr, lg, lb, 255),
+        selected_icon: (lr, lg, lb),
+        accent_label: (cr, cg, cb, 255),
+        accent_hint: (cr, cg, cb, ACCENT_HINT_ALPHA),
         overlay: OVERLAY_PIXEL,
         selection_border: pack_argb(255, fr, fg, fb),
         highlight_fill: pack_argb(
@@ -355,6 +400,15 @@ fn from_shared(shared: &SharedAppearance) -> ColorSet {
             premul(ab, HIGHLIGHT_FILL_ALPHA),
         ),
         highlight_border: pack_argb(255, ar, ag, ab),
+    }
+}
+
+fn contrasting_rgb(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
+    let luma = (u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114) / 1000;
+    if luma > 128 {
+        (0, 0, 0)
+    } else {
+        (255, 255, 255)
     }
 }
 
@@ -481,6 +535,13 @@ family = "JetBrainsMono Nerd Font Mono"
         assert!(loaded.warnings.is_empty());
         assert_eq!(loaded.appearance.colors.panel_fill, (32, 32, 36, 236));
         assert_eq!(loaded.appearance.colors.accent, (10, 132, 255, 255));
+        assert_eq!(loaded.appearance.colors.selected, (10, 132, 255, 255));
+        assert_eq!(
+            loaded.appearance.colors.selected_label,
+            (255, 255, 255, 255)
+        );
+        assert_eq!(loaded.appearance.colors.hover, (255, 255, 255, 22));
+        assert_eq!(loaded.appearance.colors.accent_label, (255, 255, 255, 255));
         assert_eq!(loaded.appearance.colors.highlight_border, 0xFF0A_84FF);
         assert_eq!(loaded.appearance.colors.highlight_fill, 0x3802_1D38);
         assert_eq!(loaded.appearance.colors.overlay, 0x9900_0000);
@@ -506,7 +567,11 @@ theme_file = "theme.toml"
         assert_eq!(c.text_muted, (0xA4, 0xB8, 0xCF, 150));
         assert_eq!(c.hover, (0x24, 0x4A, 0x70, 22));
         assert_eq!(c.icon, (0xEA, 0xF3, 0xFF));
-        assert_eq!(c.accent_label, (255, 255, 255, 255));
+        assert_eq!(c.selected, (0x24, 0x4A, 0x70, 255));
+        assert_eq!(c.selected_label, (255, 255, 255, 255));
+        assert_eq!(c.selected_icon, (255, 255, 255));
+        assert_eq!(c.accent_label, (0, 0, 0, 255));
+        assert_eq!(c.accent_hint, (0, 0, 0, ACCENT_HINT_ALPHA));
         assert_eq!(c.panel_border, (0xEA, 0xF3, 0xFF, 30));
         assert_eq!(c.highlight_border, pack_argb(255, 0x80, 0xD4, 0xFF));
         assert_eq!(
@@ -519,6 +584,45 @@ theme_file = "theme.toml"
             )
         );
         assert_eq!(c.overlay, 0x9900_0000);
+    }
+
+    #[test]
+    fn selection_pair_is_not_used_as_on_accent_text() {
+        let dir = TempDir::new();
+        write_theme(
+            &dir,
+            "theme.toml",
+            r##"
+version = 1
+
+[colors]
+background = "#000000"
+foreground = "#FFFFFF"
+accent = "#FFFFFF"
+muted = "#AAAAAA"
+selection_background = "#0000FF"
+selection_foreground = "#FFFFFF"
+
+[font]
+family = "Roboto"
+"##,
+        );
+        let loaded = load(
+            &dir,
+            r#"
+[appearance]
+theme_file = "theme.toml"
+"#,
+        );
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        let c = loaded.appearance.colors;
+        assert_eq!(c.selected, (0, 0, 255, 255));
+        assert_eq!(c.selected_label, (255, 255, 255, 255));
+        assert_eq!(c.selected_icon, (255, 255, 255));
+        assert_eq!(c.accent, (255, 255, 255, 255));
+        assert_eq!(c.accent_label, (0, 0, 0, 255));
+        assert_eq!(c.text, (255, 255, 255, TEXT_ALPHA));
+        assert_eq!(c.hover, (0, 0, 255, HOVER_ALPHA));
     }
 
     #[test]
