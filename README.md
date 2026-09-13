@@ -182,12 +182,14 @@ Without that file, crabture keeps the built-in dark toolbar palette and bundled 
 | Shared role | Crabture mapping |
 | --- | --- |
 | `colors.background` | Toolbar panel RGB (native panel alpha kept) |
-| `colors.foreground` | Toolbar text/icon RGB (role alpha kept); selection border |
-| `colors.accent` | Active mode, Capture action, window-highlight border/fill |
+| `colors.foreground` | Inactive toolbar text/icon RGB (role alpha kept); selection border |
+| `colors.accent` | Capture action fill, window-highlight border/fill |
 | `colors.muted` | Secondary labels and shortcut hints |
-| `colors.selection_background` | Hover wash |
-| `colors.selection_foreground` | Text on accent actions |
+| `colors.selection_background` | Active mode fill; hover wash |
+| `colors.selection_foreground` | Active mode labels, shortcuts, and icons |
 | `font.family` | Loaded via `fc-match` after an explicit `[font] path`; bundled Roboto if missing |
+
+Capture label and hint colors are not a shared role. Crabture picks black or white from the accent's luminance so the action stays readable when `accent` and the selection pair differ. Without a theme or color overrides, the built-in dark toolbar is kept explicitly and does not go through that mapping.
 
 Explicit `[colors]` / `[font]` fields always win, even when they equal an old default. Overlay dimming, radii, and spacing stay application-owned. A missing or invalid `theme_file` prints a warning to stderr and is ignored; crabture still opens and keeps valid overrides. Unknown keys in `appearance.toml` reject that file and fall back to the built-in appearance.
 

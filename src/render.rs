@@ -585,11 +585,13 @@ fn render_button(
 ) {
     let colors = &appearance.colors;
     let font = appearance.font();
-    // Background: accent pill for the active mode / accent action, hover wash
-    // otherwise.
+    // Background: selection pill for the active mode, accent for Capture, hover
+    // wash otherwise.
     let active_mode = matches!(button.kind, ToolKind::Mode { mode, .. } if mode == prefs.mode);
     let accent_action = matches!(button.kind, ToolKind::Action { accent: true, .. });
-    if active_mode || accent_action {
+    if active_mode {
+        fill_round_rect(pm, px, py, pw, ph, BTN_RADIUS * scale, colors.selected);
+    } else if accent_action {
         fill_round_rect(pm, px, py, pw, ph, BTN_RADIUS * scale, colors.accent);
     } else if hovered {
         fill_round_rect(pm, px, py, pw, ph, BTN_RADIUS * scale, colors.hover);
@@ -609,7 +611,16 @@ fn render_button(
             let icon_px = (ICON * scale).round() as u32;
             let icon_y = py + (ph - ICON * scale) / 2.0;
             let icon_x = px + BTN_PAD_X * scale;
-            if let Some(icon_pm) = rasterize_icon(*icon, icon_px, colors.icon) {
+            let (icon_rgb, label_color, short_color) = if active_mode {
+                (
+                    colors.selected_icon,
+                    colors.selected_label,
+                    colors.selected_label,
+                )
+            } else {
+                (colors.icon, colors.text, colors.text_muted)
+            };
+            if let Some(icon_pm) = rasterize_icon(*icon, icon_px, icon_rgb) {
                 let opacity = if active_mode { 1.0 } else { 0.82 };
                 pm.draw_pixmap(
                     icon_x.round() as i32,
@@ -632,15 +643,10 @@ fn render_button(
                 baseline,
                 label,
                 LABEL_PX * scale,
-                colors.text,
+                label_color,
             );
             let label_w = text_width(font, label, LABEL_PX) * scale;
             let short_x = label_x + label_w + SHORT_GAP * scale;
-            let short_color = if active_mode {
-                colors.text
-            } else {
-                colors.text_muted
-            };
             draw_text(
                 pm,
                 font,
@@ -922,6 +928,100 @@ mod tests {
         assert!(p2.height() >= p1.height() * 2 - 2);
     }
 
+    fn rgba_at(pm: &Pixmap, x: u32, y: u32) -> (u8, u8, u8, u8) {
+        let i = ((y * pm.width() + x) * 4) as usize;
+        let d = pm.data();
+        (d[i], d[i + 1], d[i + 2], d[i + 3])
+    }
+
+    fn button_fill_px(layout: &[ToolButton], index: usize, scale: f32) -> (u32, u32) {
+        let first = &layout[0];
+        let ox = first.rect.0 - PANEL_PAD_X;
+        let oy = first.rect.1 - PANEL_PAD_Y;
+        let (bx, by, bw, _) = layout[index].rect;
+        (
+            ((bx + bw / 2.0 - ox) * scale).round() as u32,
+            ((by + 5.0 - oy) * scale).round() as u32,
+        )
+    }
+
+    fn button_has_color_near(
+        pm: &Pixmap,
+        layout: &[ToolButton],
+        index: usize,
+        scale: f32,
+        target: (u8, u8, u8),
+        rival: (u8, u8, u8),
+    ) -> bool {
+        let first = &layout[0];
+        let ox = first.rect.0 - PANEL_PAD_X;
+        let oy = first.rect.1 - PANEL_PAD_Y;
+        let (bx, by, bw, bh) = layout[index].rect;
+        let x0 = ((bx - ox + 4.0) * scale).floor().max(0.0) as u32;
+        let y0 = ((by - oy + 4.0) * scale).floor().max(0.0) as u32;
+        let x1 = ((bx + bw - ox - 4.0) * scale).ceil().min(pm.width() as f32) as u32;
+        let y1 = ((by + bh - oy - 4.0) * scale)
+            .ceil()
+            .min(pm.height() as f32) as u32;
+        let dist = |a: (u8, u8, u8), b: (u8, u8, u8)| {
+            let dr = i32::from(a.0) - i32::from(b.0);
+            let dg = i32::from(a.1) - i32::from(b.1);
+            let db = i32::from(a.2) - i32::from(b.2);
+            dr * dr + dg * dg + db * db
+        };
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let (r, g, b, a) = rgba_at(pm, x, y);
+                if a == 0 {
+                    continue;
+                }
+                if dist((r, g, b), target) < dist((r, g, b), rival) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn contrast_theme_appearance() -> Appearance {
+        let dir = std::env::temp_dir().join(format!(
+            "crabture-render-contrast-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("theme.toml"),
+            r##"
+version = 1
+
+[colors]
+background = "#000000"
+foreground = "#FF0000"
+accent = "#00FF00"
+muted = "#AAAAAA"
+selection_background = "#0000FF"
+selection_foreground = "#FFFF00"
+
+[font]
+family = "Roboto"
+"##,
+        )
+        .unwrap();
+        let appearance = crate::appearance::resolve_from_toml(
+            "[appearance]\ntheme_file = \"theme.toml\"\n",
+            Some(&dir),
+            None,
+        )
+        .unwrap()
+        .appearance;
+        let _ = std::fs::remove_dir_all(dir);
+        appearance
+    }
+
     #[test]
     fn themed_appearance_changes_toolbar_pixels() {
         let dir =
@@ -960,6 +1060,128 @@ family = "JetBrainsMono Nerd Font Mono"
         let (pm_themed, _, _) = render_toolbar(&themed_layout, prefs(), &themed, 1, None).unwrap();
         assert_ne!(pm_default.data(), pm_themed.data());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn built_in_active_mode_and_capture_keep_legacy_blue_pills() {
+        let appearance = appearance();
+        let p = prefs();
+        let layout = toolbar_layout(1920, 1080, p, &appearance);
+        let capture = layout
+            .iter()
+            .position(|b| b.command == SessionCommand::Capture)
+            .unwrap();
+        let (pm, _, _) = render_toolbar(&layout, p, &appearance, 1, None).unwrap();
+        let (ax, ay) = button_fill_px(&layout, 0, 1.0);
+        let (cx, cy) = button_fill_px(&layout, capture, 1.0);
+        assert_eq!(rgba_at(&pm, ax, ay), (10, 132, 255, 255));
+        assert_eq!(rgba_at(&pm, cx, cy), (10, 132, 255, 255));
+        assert!(button_has_color_near(
+            &pm,
+            &layout,
+            0,
+            1.0,
+            (255, 255, 255),
+            (10, 132, 255)
+        ));
+        assert!(button_has_color_near(
+            &pm,
+            &layout,
+            capture,
+            1.0,
+            (255, 255, 255),
+            (10, 132, 255)
+        ));
+    }
+
+    #[test]
+    fn active_mode_uses_selection_pair_and_capture_uses_on_accent() {
+        let appearance = contrast_theme_appearance();
+        let p = prefs();
+        let layout = toolbar_layout(1920, 1080, p, &appearance);
+        let capture = layout
+            .iter()
+            .position(|b| b.command == SessionCommand::Capture)
+            .unwrap();
+        let inactive = layout
+            .iter()
+            .position(|b| matches!(b.command, SessionCommand::SetMode(CaptureMode::Window)))
+            .unwrap();
+        let (pm, _, _) = render_toolbar(&layout, p, &appearance, 1, None).unwrap();
+        let scale = 1.0;
+
+        let (ax, ay) = button_fill_px(&layout, 0, scale);
+        assert_eq!(rgba_at(&pm, ax, ay), (0, 0, 255, 255));
+        assert!(button_has_color_near(
+            &pm,
+            &layout,
+            0,
+            scale,
+            (255, 255, 0),
+            (0, 0, 255)
+        ));
+
+        let (cx, cy) = button_fill_px(&layout, capture, scale);
+        assert_eq!(rgba_at(&pm, cx, cy), (0, 255, 0, 255));
+        assert!(button_has_color_near(
+            &pm,
+            &layout,
+            capture,
+            scale,
+            (0, 0, 0),
+            (0, 255, 0)
+        ));
+
+        let (ix, iy) = button_fill_px(&layout, inactive, scale);
+        assert_eq!(rgba_at(&pm, ix, iy), (0, 0, 0, 236));
+        assert!(!button_has_color_near(
+            &pm,
+            &layout,
+            inactive,
+            scale,
+            (0, 0, 255),
+            (0, 0, 0)
+        ));
+        assert!(!button_has_color_near(
+            &pm,
+            &layout,
+            inactive,
+            scale,
+            (0, 255, 0),
+            (0, 0, 0)
+        ));
+    }
+
+    #[test]
+    fn hover_wash_skips_selected_and_capture_and_redraws_inactive() {
+        let appearance = contrast_theme_appearance();
+        let p = prefs();
+        let layout = toolbar_layout(1920, 1080, p, &appearance);
+        let capture = layout
+            .iter()
+            .position(|b| b.command == SessionCommand::Capture)
+            .unwrap();
+        let inactive = layout
+            .iter()
+            .position(|b| matches!(b.command, SessionCommand::SetMode(CaptureMode::Window)))
+            .unwrap();
+        let (plain, _, _) = render_toolbar(&layout, p, &appearance, 1, None).unwrap();
+        let (hovered_inactive, _, _) =
+            render_toolbar(&layout, p, &appearance, 1, Some(inactive)).unwrap();
+        let (hovered_selected, _, _) = render_toolbar(&layout, p, &appearance, 1, Some(0)).unwrap();
+        let (hovered_capture, _, _) =
+            render_toolbar(&layout, p, &appearance, 1, Some(capture)).unwrap();
+
+        assert_ne!(plain.data(), hovered_inactive.data());
+        assert_eq!(plain.data(), hovered_selected.data());
+        assert_eq!(plain.data(), hovered_capture.data());
+
+        let (ix, iy) = button_fill_px(&layout, inactive, 1.0);
+        assert_ne!(rgba_at(&hovered_inactive, ix, iy), rgba_at(&plain, ix, iy));
+        let (ax, ay) = button_fill_px(&layout, 0, 1.0);
+        assert_eq!(rgba_at(&hovered_inactive, ax, ay), (0, 0, 255, 255));
+        let (cx, cy) = button_fill_px(&layout, capture, 1.0);
+        assert_eq!(rgba_at(&hovered_inactive, cx, cy), (0, 255, 0, 255));
     }
 
     #[test]

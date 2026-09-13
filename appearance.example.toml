@@ -12,12 +12,15 @@
 
 # Mapping from the six Swatches roles:
 #   background            → toolbar panel RGB (native panel alpha kept)
-#   foreground            → toolbar text/icon RGB; selection border
-#   accent                → active mode, Capture, window highlight
+#   foreground            → inactive toolbar text/icon RGB; selection border
+#   accent                → Capture fill, window highlight
 #   muted                 → secondary labels and shortcut hints
-#   selection_background  → hover wash
-#   selection_foreground  → text on accent actions
+#   selection_background  → active mode fill; hover wash
+#   selection_foreground  → active mode labels, shortcuts, and icons
 #   font.family           → fc-match after an explicit [font] path
+#
+# Capture label/hint color is application-owned: black or white chosen from
+# accent luminance so the action stays readable when accent != selection.
 #
 # Explicit fields below always win over the shared theme.
 
