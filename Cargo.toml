@@ -9,7 +9,14 @@ repository = "https://github.com/piny4man/crabture"
 homepage = "https://github.com/piny4man/crabture"
 keywords = ["screenshot", "wayland", "x11", "linux", "clipboard"]
 categories = ["command-line-utilities"]
-include = ["src/**", "assets/**", "Cargo.toml", "README.md", "LICENSE"]
+include = [
+    "src/**",
+    "assets/**",
+    "appearance.example.toml",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+]
 
 [profile.release]
 lto = "thin"
@@ -46,3 +53,6 @@ tiny-skia = "0.12"
 resvg = { version = "0.47", default-features = false }
 usvg = "0.47"
 ab_glyph = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+swatches = "0.1.0"
