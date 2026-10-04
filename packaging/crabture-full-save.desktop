@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Crabture — Full screen (save)
+Comment=Capture the full primary screen immediately and save it as a PNG file
+Exec=crabture --instant
+Icon=crabture
+Categories=Utility;Graphics;
+Keywords=screenshot;capture;fullscreen;screen;save;file;png;
+Terminal=false
+NoDisplay=false

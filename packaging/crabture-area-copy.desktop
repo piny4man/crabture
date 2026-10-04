@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Crabture — Area (copy)
+Comment=Draw an area selection and copy the capture to the clipboard
+Exec=crabture --select --copy
+Icon=crabture
+Categories=Utility;Graphics;
+Keywords=screenshot;capture;area;region;selection;clipboard;copy;
+Terminal=false
+NoDisplay=false
