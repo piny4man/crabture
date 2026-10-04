@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Crabture
+Comment=Graphical screenshot UI — pick area, window or full screen; choose copy, save or both
+Exec=crabture
+Icon=crabture
+Categories=Utility;Graphics;
+Keywords=screenshot;capture;screen;snip;clipboard;
+Terminal=false
+NoDisplay=false
