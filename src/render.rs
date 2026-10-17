@@ -11,6 +11,7 @@
 //! canvas.
 
 use crate::appearance::Appearance;
+use crate::scene::Rect;
 use crate::session::SessionCommand;
 use crate::session::{CaptureMode, GraphicalPreferences, OutputDestination, SaveLocationChoice};
 use ab_glyph::{Font, FontVec, ScaleFont, point};
@@ -744,22 +745,30 @@ fn render_button(
 }
 
 /// Source-over composite a premultiplied-RGBA pixmap onto a premultiplied
-/// ARGB8888-LE (BGRA byte order) canvas stored as packed `u32`s.
+/// ARGB8888-LE (BGRA byte order) canvas stored as packed `u32`s, touching
+/// only the canvas pixels inside `clip`.
 #[hotpath::measure]
-pub fn blit_argb(dst: &mut [u32], dst_w: usize, dst_h: usize, src: &Pixmap, ox: i32, oy: i32) {
-    let sw = src.width() as i32;
-    let sh = src.height() as i32;
+pub fn blit_argb(
+    dst: &mut [u32],
+    dst_w: usize,
+    dst_h: usize,
+    src: &Pixmap,
+    ox: i32,
+    oy: i32,
+    clip: Rect,
+) {
+    let sw = src.width() as i64;
+    let sh = src.height() as i64;
     let data = src.data();
-    for sy in 0..sh {
-        let dy = oy + sy;
-        if dy < 0 || dy >= dst_h as i32 {
-            continue;
-        }
-        for sx in 0..sw {
-            let dx = ox + sx;
-            if dx < 0 || dx >= dst_w as i32 {
-                continue;
-            }
+    let (ox, oy) = (ox as i64, oy as i64);
+    let x0 = (clip.x0 as i64).max(ox).max(0);
+    let y0 = (clip.y0 as i64).max(oy).max(0);
+    let x1 = (clip.x1.min(dst_w) as i64).min(ox + sw);
+    let y1 = (clip.y1.min(dst_h) as i64).min(oy + sh);
+    for dy in y0..y1 {
+        let sy = dy - oy;
+        for dx in x0..x1 {
+            let sx = dx - ox;
             let so = ((sy * sw + sx) * 4) as usize;
             let (sr, sg, sb, sa) = (data[so], data[so + 1], data[so + 2], data[so + 3]);
             if sa == 0 {
@@ -814,7 +823,7 @@ mod tests {
         // White, fully opaque (premultiplied RGBA).
         pm.fill(Color::from_rgba8(255, 255, 255, 255));
         let mut dst = vec![0u32; 1];
-        blit_argb(&mut dst, 1, 1, &pm, 0, 0);
+        blit_argb(&mut dst, 1, 1, &pm, 0, 0, Rect::new(0, 0, 1, 1));
         assert_eq!(dst[0], pack_argb(255, 255, 255, 255));
     }
 
@@ -822,7 +831,7 @@ mod tests {
     fn transparent_source_leaves_destination() {
         let pm = Pixmap::new(1, 1).unwrap(); // transparent by default
         let mut dst = vec![pack_argb(255, 10, 20, 30); 1];
-        blit_argb(&mut dst, 1, 1, &pm, 0, 0);
+        blit_argb(&mut dst, 1, 1, &pm, 0, 0, Rect::new(0, 0, 1, 1));
         assert_eq!(dst[0], pack_argb(255, 10, 20, 30));
     }
 
@@ -832,7 +841,7 @@ mod tests {
         pm.fill(Color::from_rgba8(255, 255, 255, 255));
         let mut dst = vec![0u32; 1];
         // Offsetting fully off-canvas must not panic and must not write.
-        blit_argb(&mut dst, 1, 1, &pm, 5, 5);
+        blit_argb(&mut dst, 1, 1, &pm, 5, 5, Rect::new(0, 0, 1, 1));
         assert_eq!(dst[0], 0);
     }
 

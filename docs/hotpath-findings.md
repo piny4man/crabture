@@ -77,6 +77,18 @@ All of these run one after another on the main thread.
    previous buffer. *Expected:* draw well under one refresh (< 8 ms), feedback
    close to one or two refreshes, and about 15 ms off the open.
 
+   *Result (NUKE-116):* `src/scene.rs` describes each frame as a `Scene`;
+   `scene::damage` lists the rectangles that differ from what a buffer
+   shows, and `scene::paint` repaints only those. Each overlay keeps up to
+   three persistent buffers that remember their scene, and the surface is
+   damaged per rectangle. In one manual session per side (balanced profile,
+   same gestures), `OutputOverlay::draw` dropped from p50 5.26 ms / p95
+   6.22 ms (920 frames) to p50 0.25 ms / p95 0.89 ms (760 frames). Only
+   toolbar re-rasterizing (`render_toolbar`, ~3.4 ms on hover changes) still
+   costs whole milliseconds. `area-drag-input-to-present` p95 went from 29.1
+   to 25.0 ms. The median stays near 21 ms, which suggests the remaining
+   feedback latency is the compositor's frame scheduling, not the repaint.
+
 2. **The open is fully serial: capture, window list, appearance, then
    Wayland** (NUKE-117). `capture_all_outputs` (~30 ms) must finish before the overlay
    is mapped, so the toolbar never appears in a capture. Nothing else has to

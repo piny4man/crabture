@@ -9,6 +9,7 @@
 use crate::appearance::{Appearance, ColorSet, FontKey};
 use crate::perf::{self, InputKind, InputProbe, OpenProbe};
 use crate::render;
+use crate::scene::{self, Crosshair, Outline, Rect, Scene, Sprite};
 use crate::session::{
     AreaSelection, CaptureMode, FullScreenSelection, GraphicalPreferences, SessionCommand,
     WindowSelection,
@@ -35,7 +36,10 @@ use smithay_client_toolkit::{
             LayerSurfaceConfigure, SurfaceKind,
         },
     },
-    shm::{Shm, ShmHandler, slot::SlotPool},
+    shm::{
+        Shm, ShmHandler,
+        slot::{Buffer, SlotPool},
+    },
 };
 use std::time::Instant;
 use wayland_client::{
@@ -596,6 +600,26 @@ struct ToolbarCache {
     pixmap: tiny_skia::Pixmap,
     ox: i32,
     oy: i32,
+    /// Distinguishes this rendering from earlier ones in [`Sprite`]s.
+    generation: u64,
+}
+
+/// A persistent wl_shm buffer and the frame it currently shows.
+struct FrameBuffer {
+    buffer: Buffer,
+    size: (usize, usize),
+    /// `None` until first painted.
+    scene: Option<Scene>,
+}
+
+/// Buffers kept per overlay: one shown, one being drawn, and one spare for a
+/// compositor that holds on to the previous buffer a little longer.
+const MAX_BUFFERS: usize = 3;
+
+/// Pool bytes for two `pw`×`ph` ARGB buffers, so double buffering never
+/// grows (and remaps) the pool mid-session.
+fn pool_size(pw: usize, ph: usize) -> usize {
+    pw * ph * 4 * 2
 }
 
 /// Per-monitor overlay surface and its selection state.  One of these is
@@ -627,6 +651,12 @@ struct OutputOverlay {
     /// motion redraw the canvas every frame but must not re-rasterize the
     /// toolbar's SVG icons and text each time.
     toolbar_cache: Option<ToolbarCache>,
+    /// Bumped whenever the toolbar is re-rasterized.
+    toolbar_generation: u64,
+    /// Persistent frame buffers, reused while the size stays the same.
+    buffers: Vec<FrameBuffer>,
+    /// The last committed frame, for surface damage.
+    committed: Option<Scene>,
     /// Logical position of this output, used to translate the surface-local
     /// pointer into the global coordinate space `window_rects` live in.
     /// Seeded from `OutputInfo::logical_position`.
@@ -761,6 +791,9 @@ impl OverlayState {
             window_target: None,
             hovered_button: None,
             toolbar_cache: None,
+            toolbar_generation: 0,
+            buffers: Vec::new(),
+            committed: None,
             output_origin,
             highlighted_window: None,
             output_name,
@@ -1034,53 +1067,82 @@ impl OutputOverlay {
         let pw = lw * scale;
         let ph = lh * scale;
 
-        let needed = pw * ph * 4;
+        let needed = pool_size(pw, ph);
         if self.pool.len() < needed {
             match hotpath::measure_block!("SlotPool::new (draw)", SlotPool::new(needed, shm)) {
-                Ok(p) => self.pool = p,
+                Ok(p) => {
+                    self.pool = p;
+                    self.buffers.clear();
+                }
                 Err(_) => return,
             }
         }
 
-        let stride = pw as i32 * 4;
-        let (buffer, canvas) =
-            match self
-                .pool
-                .create_buffer(pw as i32, ph as i32, stride, wl_shm::Format::Argb8888)
-            {
-                Ok(pair) => pair,
-                Err(_) => return,
-            };
+        let scene = if hud_active {
+            self.hud_scene(lw, lh, scale, preferences, appearance, is_active)
+        } else {
+            Scene {
+                width: pw,
+                height: ph,
+                background: appearance.colors.overlay,
+                selection: selection_outline(
+                    scaled_point(self.start, scale),
+                    scaled_point(self.current, scale),
+                    scaled_rect(self.selection, scale),
+                    pw,
+                    ph,
+                    appearance.colors.selection_border,
+                ),
+                highlight: None,
+                target: None,
+                toolbar: None,
+            }
+        };
 
-        // Interpret canvas as u32 slice for fast fills.
+        // Repaint a released buffer only where it differs from this frame.
+        // Buffers persist across frames and remember what they show, so with
+        // the compositor holding the previous one, the other is at most two
+        // frames behind and catches up with thin strips, not a full refill.
+        let Some(slot) = self.free_buffer(pw, ph) else {
+            return;
+        };
+        let frame = &mut self.buffers[slot];
+        let Some(canvas) = frame.buffer.canvas(&mut self.pool) else {
+            return;
+        };
         // Safety: canvas is aligned and sized as wl_shm buffer (4-byte pixels).
         let pixels: &mut [u32] =
             unsafe { std::slice::from_raw_parts_mut(canvas.as_mut_ptr() as *mut u32, pw * ph) };
+        let toolbar = self
+            .toolbar_cache
+            .as_ref()
+            .filter(|_| scene.toolbar.is_some())
+            .map(|c| &c.pixmap);
+        for rect in scene::damage(frame.scene.as_ref(), &scene) {
+            scene::paint(pixels, &scene, toolbar, rect);
+        }
+        frame.scene = Some(scene);
 
-        if hud_active {
-            self.draw_hud(pixels, lw, lh, scale, preferences, appearance, is_active);
-        } else {
-            pixels.fill(appearance.colors.overlay);
-            draw_selection(
-                pixels,
-                pw,
-                ph,
-                scaled_point(self.start, scale),
-                scaled_point(self.current, scale),
-                scaled_rect(self.selection, scale),
-                appearance.colors.selection_border,
+        let surface = self.layer.wl_surface();
+        surface.set_buffer_scale(scale as i32);
+        // Damage only what changed since the last committed frame.  A frame
+        // that looks the same is still committed (it may answer a frame
+        // callback or a discarded open frame), damaged whole as before.
+        let mut damage = scene::damage(self.committed.as_ref(), &scene);
+        if damage.is_empty() {
+            damage.push(scene.screen());
+        }
+        for rect in damage {
+            surface.damage_buffer(
+                rect.x0 as i32,
+                rect.y0 as i32,
+                (rect.x1 - rect.x0) as i32,
+                (rect.y1 - rect.y0) as i32,
             );
         }
+        self.committed = Some(scene);
 
-        self.layer.wl_surface().set_buffer_scale(scale as i32);
-
-        self.layer
-            .wl_surface()
-            .damage_buffer(0, 0, pw as i32, ph as i32);
-
-        buffer
-            .attach_to(self.layer.wl_surface())
-            .expect("buffer attach");
+        frame.buffer.attach_to(surface).expect("buffer attach");
 
         // Throttle redraws to the compositor's frame clock: always request a
         // callback for the next frame so motion-driven redraws (HUD hover,
@@ -1119,71 +1181,106 @@ impl OutputOverlay {
         self.layer.commit();
     }
 
+    /// Index of a `pw`×`ph` buffer the compositor has released, creating one
+    /// when every buffer is still in use.  A new buffer shows nothing yet, so
+    /// its first frame is painted whole.
+    fn free_buffer(&mut self, pw: usize, ph: usize) -> Option<usize> {
+        self.buffers.retain(|b| b.size == (pw, ph));
+        if let Some(idx) = self
+            .buffers
+            .iter()
+            .position(|b| b.buffer.canvas(&mut self.pool).is_some())
+        {
+            return Some(idx);
+        }
+        if self.buffers.len() >= MAX_BUFFERS {
+            // Dropping a buffer the compositor still holds destroys it once
+            // released; its slot then returns to the pool.
+            self.buffers.remove(0);
+        }
+        let (buffer, _) = self
+            .pool
+            .create_buffer(
+                pw as i32,
+                ph as i32,
+                pw as i32 * 4,
+                wl_shm::Format::Argb8888,
+            )
+            .ok()?;
+        self.buffers.push(FrameBuffer {
+            buffer,
+            size: (pw, ph),
+            scene: None,
+        });
+        Some(self.buffers.len() - 1)
+    }
+
+    /// Describe the HUD frame: the mode's canvas, then the toolbar on the
+    /// active output, re-rasterizing the toolbar only when its inputs change.
     #[allow(clippy::too_many_arguments)]
     #[hotpath::measure(impl_type = "OutputOverlay")]
-    fn draw_hud(
+    fn hud_scene(
         &mut self,
-        pixels: &mut [u32],
         lw: usize,
         lh: usize,
         scale: usize,
         preferences: GraphicalPreferences,
         appearance: &Appearance,
         is_active: bool,
-    ) {
+    ) -> Scene {
         let pw = lw * scale;
         let ph = lh * scale;
         let colors = appearance.colors;
+        let mut scene = Scene {
+            width: pw,
+            height: ph,
+            background: CLEAR_PIXEL,
+            selection: None,
+            highlight: None,
+            target: None,
+            toolbar: None,
+        };
         if preferences.mode == CaptureMode::Area {
-            pixels.fill(colors.overlay);
-            draw_selection(
-                pixels,
-                pw,
-                ph,
+            scene.background = colors.overlay;
+            scene.selection = selection_outline(
                 scaled_point(self.start, scale),
                 scaled_point(self.current, scale),
                 scaled_rect(self.selection, scale),
+                pw,
+                ph,
                 colors.selection_border,
             );
         } else if preferences.mode == CaptureMode::Window {
-            pixels.fill(CLEAR_PIXEL);
             if let Some(rect) = self.highlighted_window {
-                draw_window_highlight(
-                    pixels,
+                scene.highlight = window_highlight_outline(
+                    rect,
                     pw,
                     ph,
-                    rect,
                     scale,
                     colors.highlight_fill,
                     colors.highlight_border,
                 );
             } else if let Some(point) = self.window_target {
-                draw_window_target(
-                    pixels,
-                    pw,
-                    ph,
+                scene.target = Some(window_target_crosshair(
                     (point.0 as usize * scale, point.1 as usize * scale),
                     scale,
                     colors.selection_border,
-                );
+                ));
             }
-        } else {
-            pixels.fill(CLEAR_PIXEL);
         }
 
         // Only the active output (the monitor the pointer is on) composites the
         // macOS-style toolbar, so it follows the cursor across displays.
         if !is_active {
-            return;
+            return scene;
         }
 
-        // Composite the toolbar over the canvas.  Rasterizing it (SVG icons +
-        // anti-aliased text) is comparatively expensive, so cache the rendered
-        // pixmap and only rebuild when an input that affects the toolbar changes
-        // — never on plain window-target / area-drag motion, which redraw the
-        // canvas every frame.  Layout is in logical coordinates so it stays in
-        // sync with the pointer hit-test; the renderer scales it to the physical
-        // buffer resolution.
+        // Rasterizing the toolbar (SVG icons + anti-aliased text) is
+        // comparatively expensive, so cache the rendered pixmap and only
+        // rebuild when an input that affects the toolbar changes — never on
+        // plain window-target / area-drag motion.  Layout is in logical
+        // coordinates so it stays in sync with the pointer hit-test; the
+        // renderer scales it to the physical buffer resolution.
         let cache_hit = self.toolbar_cache.as_ref().is_some_and(|c| {
             c.prefs == preferences
                 && c.colors == colors
@@ -1195,6 +1292,8 @@ impl OutputOverlay {
         });
         if !cache_hit {
             let layout = render::toolbar_layout(lw, lh, preferences, appearance);
+            self.toolbar_generation += 1;
+            let generation = self.toolbar_generation;
             self.toolbar_cache = render::render_toolbar(
                 &layout,
                 preferences,
@@ -1213,11 +1312,17 @@ impl OutputOverlay {
                 pixmap,
                 ox,
                 oy,
+                generation,
             });
         }
-        if let Some(c) = &self.toolbar_cache {
-            render::blit_argb(pixels, pw, ph, &c.pixmap, c.ox, c.oy);
-        }
+        scene.toolbar = self.toolbar_cache.as_ref().map(|c| Sprite {
+            ox: c.ox,
+            oy: c.oy,
+            width: c.pixmap.width() as usize,
+            height: c.pixmap.height() as usize,
+            generation: c.generation,
+        });
+        scene
     }
 }
 
@@ -1286,6 +1391,69 @@ fn scaled_rect(rect: Option<SelectionRect>, scale: usize) -> Option<SelectionRec
     rect.map(|(x, y, w, h)| (x * s, y * s, w * s, h * s))
 }
 
+/// The area selection as drawn into a `w`×`h` buffer: a cleared interior with
+/// a 1 px border.  All inputs are physical.
+fn selection_outline(
+    start: Option<(f64, f64)>,
+    current: Option<(f64, f64)>,
+    selection: Option<SelectionRect>,
+    w: usize,
+    h: usize,
+    border: u32,
+) -> Option<Outline> {
+    let (x, y, width, height) = drawn_selection_rect(start, current, selection)?;
+    let rect = Rect::new(
+        (x as usize).min(w.saturating_sub(1)),
+        (y as usize).min(h.saturating_sub(1)),
+        (x as usize + width as usize).min(w),
+        (y as usize + height as usize).min(h),
+    );
+    (!rect.is_empty()).then_some(Outline {
+        rect,
+        fill: CLEAR_PIXEL,
+        border,
+        thickness: 1,
+    })
+}
+
+/// The hovered window's tint and border.  `rect` is in surface-local logical
+/// coordinates (its origin may be negative if the window extends off the
+/// output's top/left); it is scaled to physical pixels and clamped to the
+/// `w`×`h` buffer.
+fn window_highlight_outline(
+    rect: (i32, i32, u32, u32),
+    w: usize,
+    h: usize,
+    scale: usize,
+    fill: u32,
+    border: u32,
+) -> Option<Outline> {
+    let s = scale as i32;
+    let clamp = |v: i32, max: usize| v.clamp(0, max as i32) as usize;
+    let rect = Rect::new(
+        clamp(rect.0 * s, w),
+        clamp(rect.1 * s, h),
+        clamp((rect.0 + rect.2 as i32) * s, w),
+        clamp((rect.1 + rect.3 as i32) * s, h),
+    );
+    (!rect.is_empty()).then_some(Outline {
+        rect,
+        fill,
+        border,
+        thickness: scale.max(1) * 2,
+    })
+}
+
+/// The window-mode crosshair at a physical `point`.
+fn window_target_crosshair(point: (usize, usize), scale: usize, color: u32) -> Crosshair {
+    Crosshair {
+        x: point.0,
+        y: point.1,
+        radius: 18 * scale,
+        color,
+    }
+}
+
 /// Find the window under a surface-local logical `point` and return it in
 /// surface-local logical coordinates.  `window_rects` are global logical rects
 /// in capture-selection order; `origin` is the overlay output's logical
@@ -1305,129 +1473,6 @@ fn window_rect_at_point(
             *w > 0 && *h > 0 && gx >= *x && gy >= *y && gx < x + *w as i32 && gy < y + *h as i32
         })
         .map(|(x, y, w, h)| (x - origin.0, y - origin.1, w, h))
-}
-
-/// Fill the hovered window's rectangle with a translucent accent tint and a
-/// solid accent border.  `rect` is in surface-local logical coordinates (its
-/// origin may be negative if the window extends off the output's top/left); it
-/// is scaled to physical pixels and clamped to the buffer.
-#[hotpath::measure]
-fn draw_window_highlight(
-    pixels: &mut [u32],
-    w: usize,
-    h: usize,
-    rect: (i32, i32, u32, u32),
-    scale: usize,
-    fill: u32,
-    border: u32,
-) {
-    let s = scale as i32;
-    let left = (rect.0 * s).clamp(0, w as i32);
-    let top = (rect.1 * s).clamp(0, h as i32);
-    let right = ((rect.0 + rect.2 as i32) * s).clamp(0, w as i32);
-    let bottom = ((rect.1 + rect.3 as i32) * s).clamp(0, h as i32);
-    if right <= left || bottom <= top {
-        return;
-    }
-    let (left, top, right, bottom) = (left as usize, top as usize, right as usize, bottom as usize);
-
-    for y in top..bottom {
-        let row = y * w;
-        for px in &mut pixels[row + left..row + right] {
-            *px = fill;
-        }
-    }
-
-    let thickness = scale.max(1) * 2;
-    for y in top..bottom {
-        let row = y * w;
-        let on_h_edge = y < top + thickness || y >= bottom.saturating_sub(thickness);
-        if on_h_edge {
-            for px in &mut pixels[row + left..row + right] {
-                *px = border;
-            }
-        } else {
-            let left_edge = (left + thickness).min(right);
-            for px in &mut pixels[row + left..row + left_edge] {
-                *px = border;
-            }
-            let right_edge = right.saturating_sub(thickness).max(left);
-            for px in &mut pixels[row + right_edge..row + right] {
-                *px = border;
-            }
-        }
-    }
-}
-
-fn draw_window_target(
-    pixels: &mut [u32],
-    w: usize,
-    h: usize,
-    point: (usize, usize),
-    scale: usize,
-    color: u32,
-) {
-    let cx = point.0;
-    let cy = point.1;
-    let radius = 18usize * scale;
-
-    if cy < h {
-        let left = cx.saturating_sub(radius);
-        let right = (cx + radius + 1).min(w);
-        for x in left..right {
-            pixels[cy * w + x] = color;
-        }
-    }
-    if cx < w {
-        let top = cy.saturating_sub(radius);
-        let bottom = (cy + radius + 1).min(h);
-        for y in top..bottom {
-            pixels[y * w + cx] = color;
-        }
-    }
-}
-
-#[hotpath::measure]
-fn draw_selection(
-    pixels: &mut [u32],
-    w: usize,
-    h: usize,
-    start: Option<(f64, f64)>,
-    current: Option<(f64, f64)>,
-    selection: Option<SelectionRect>,
-    border: u32,
-) {
-    if let Some((x, y, width, height)) = drawn_selection_rect(start, current, selection) {
-        let x1 = (x as usize).min(w.saturating_sub(1));
-        let y1 = (y as usize).min(h.saturating_sub(1));
-        let x2 = (x as usize + width as usize).min(w);
-        let y2 = (y as usize + height as usize).min(h);
-
-        if x2 > x1 && y2 > y1 {
-            for row in y1..y2 {
-                let start = row * w + x1;
-                let end = row * w + x2;
-                pixels[start..end].fill(CLEAR_PIXEL);
-            }
-
-            let top_start = y1 * w + x1;
-            let top_end = y1 * w + x2;
-            pixels[top_start..top_end].fill(border);
-
-            if y2 > y1 + 1 {
-                let bot_start = (y2 - 1) * w + x1;
-                let bot_end = (y2 - 1) * w + x2;
-                pixels[bot_start..bot_end].fill(border);
-            }
-
-            for row in y1..y2 {
-                pixels[row * w + x1] = border;
-                if x2 > x1 + 1 {
-                    pixels[row * w + x2 - 1] = border;
-                }
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1578,12 +1623,13 @@ impl LayerShellHandler for OverlayState {
             // Allocate pool now that we know the surface size.  Size it for the
             // physical-resolution buffer (logical × scale, squared).
             let scale = ov.buffer_scale.max(1) as usize;
-            let needed = (ov.surface_w as usize * scale) * (ov.surface_h as usize * scale) * 4;
+            let needed = pool_size(ov.surface_w as usize * scale, ov.surface_h as usize * scale);
             if ov.pool.len() < needed
                 && let Ok(p) =
                     hotpath::measure_block!("SlotPool::new (configure)", SlotPool::new(needed, shm))
             {
                 ov.pool = p;
+                ov.buffers.clear();
             }
 
             ov.first_configure
@@ -2375,12 +2421,59 @@ mod tests {
         assert_eq!(colors.highlight_border, 0xFF0A_84FF);
     }
 
+    /// A full repaint of a window-mode frame (clear background).
+    fn painted(
+        w: usize,
+        h: usize,
+        highlight: Option<Outline>,
+        target: Option<Crosshair>,
+    ) -> Vec<u32> {
+        let scene = Scene {
+            width: w,
+            height: h,
+            background: CLEAR_PIXEL,
+            selection: None,
+            highlight,
+            target,
+            toolbar: None,
+        };
+        let mut pixels = vec![0xdead_beef; w * h];
+        scene::paint(&mut pixels, &scene, None, scene.screen());
+        pixels
+    }
+
+    #[test]
+    fn selection_outline_matches_the_drawn_drag() {
+        // The in-progress drag wins over the committed selection, and the
+        // rect is clamped into the buffer.
+        let outline = selection_outline(
+            Some((30.0, 30.0)),
+            Some((10.0, 20.0)),
+            Some((0, 0, 5, 5)),
+            25,
+            25,
+            1,
+        )
+        .unwrap();
+        assert_eq!(outline.rect, Rect::new(10, 20, 25, 25));
+        assert_eq!((outline.fill, outline.thickness), (CLEAR_PIXEL, 1));
+        assert_eq!(
+            selection_outline(None, None, Some((3, 3, 0, 4)), 25, 25, 1),
+            None
+        );
+        assert_eq!(selection_outline(None, None, None, 25, 25, 1), None);
+    }
+
     #[test]
     fn draws_window_target_marker() {
-        let mut pixels = vec![CLEAR_PIXEL; 20 * 20];
         let border = ColorSet::built_in().selection_border;
 
-        draw_window_target(&mut pixels, 20, 20, (10, 10), 1, border);
+        let pixels = painted(
+            20,
+            20,
+            None,
+            Some(window_target_crosshair((10, 10), 1, border)),
+        );
 
         assert_eq!(pixels[10 * 20 + 10], border);
         assert_eq!(pixels[10 * 20], border);
@@ -2399,10 +2492,13 @@ mod tests {
     #[test]
     fn draws_scaled_window_target_marker() {
         // At scale 2 the marker is drawn in a physical-resolution buffer.
-        let mut pixels = vec![CLEAR_PIXEL; 40 * 40];
-
         let border = ColorSet::built_in().selection_border;
-        draw_window_target(&mut pixels, 40, 40, (20, 20), 2, border);
+        let pixels = painted(
+            40,
+            40,
+            None,
+            Some(window_target_crosshair((20, 20), 2, border)),
+        );
 
         // Centre crosshair lands at the scaled point.
         assert_eq!(pixels[20 * 40 + 20], border);
@@ -2445,18 +2541,16 @@ mod tests {
 
     #[test]
     fn draws_window_highlight_fill_and_border() {
-        let mut pixels = vec![CLEAR_PIXEL; 40 * 40];
-
         let colors = ColorSet::built_in();
-        draw_window_highlight(
-            &mut pixels,
-            40,
-            40,
+        let highlight = window_highlight_outline(
             (10, 10, 20, 20),
+            40,
+            40,
             1,
             colors.highlight_fill,
             colors.highlight_border,
         );
+        let pixels = painted(40, 40, highlight, None);
 
         // Interior is the translucent fill.
         assert_eq!(pixels[20 * 40 + 20], colors.highlight_fill);
@@ -2470,18 +2564,16 @@ mod tests {
     fn window_highlight_clips_to_buffer_bounds() {
         // A window extending past the top/left of the output (negative origin)
         // and beyond the right/bottom is clipped without panicking.
-        let mut pixels = vec![CLEAR_PIXEL; 20 * 20];
-
         let colors = ColorSet::built_in();
-        draw_window_highlight(
-            &mut pixels,
-            20,
-            20,
+        let highlight = window_highlight_outline(
             (-10, -10, 40, 40),
+            20,
+            20,
             1,
             colors.highlight_fill,
             colors.highlight_border,
         );
+        let pixels = painted(20, 20, highlight, None);
 
         // The visible portion is filled (border within the first rows/cols).
         assert_eq!(pixels[0], colors.highlight_border);
@@ -2630,21 +2722,39 @@ mod hotpath_profile {
         let mut pixels = vec![0u32; pw * ph];
         let prefs = GraphicalPreferences::default();
         let layout = render::toolbar_layout(lw, lh, prefs, &appearance);
-        if let Some((pixmap, ox, oy)) =
-            render::render_toolbar(&layout, prefs, &appearance, scale, Some(0))
-        {
-            render::blit_argb(&mut pixels, pw, ph, &pixmap, ox, oy);
+        let toolbar = render::render_toolbar(&layout, prefs, &appearance, scale, Some(0));
+        let before = Scene {
+            width: pw,
+            height: ph,
+            background: 0x9900_0000,
+            selection: selection_outline(
+                Some((10.0, 10.0)),
+                Some((120.0, 90.0)),
+                None,
+                pw,
+                ph,
+                0xffff_ffff,
+            ),
+            highlight: window_highlight_outline((5, 5, 50, 40), pw, ph, scale, 1, 2),
+            target: None,
+            toolbar: toolbar.as_ref().map(|(pixmap, ox, oy)| Sprite {
+                ox: *ox,
+                oy: *oy,
+                width: pixmap.width() as usize,
+                height: pixmap.height() as usize,
+                generation: 1,
+            }),
+        };
+        let after = Scene {
+            selection: selection_outline(None, None, Some((14, 12, 110, 80)), pw, ph, 0xffff_ffff),
+            ..before
+        };
+        let pixmap = toolbar.as_ref().map(|(pixmap, _, _)| pixmap);
+        for (old, new) in [(None, &before), (Some(&before), &after)] {
+            for rect in scene::damage(old, new) {
+                scene::paint(&mut pixels, new, pixmap, rect);
+            }
         }
-        draw_selection(
-            &mut pixels,
-            pw,
-            ph,
-            Some((10.0, 10.0)),
-            Some((120.0, 90.0)),
-            None,
-            0xffff_ffff,
-        );
-        draw_window_highlight(&mut pixels, pw, ph, (5, 5, 50, 40), scale, 1, 2);
 
         let rect = move_selection_rect((10, 10, 40, 40), (5, -3), (lw as u32, lh as u32));
         let rect = resize_selection_rect(
@@ -2689,8 +2799,8 @@ mod hotpath_profile {
             "draw_text",
             "rasterize_icon",
             "blit_argb",
-            "draw_selection",
-            "draw_window_highlight",
+            "damage",
+            "paint",
             "move_selection_rect",
             "resize_selection_rect",
             "selected_area_image",

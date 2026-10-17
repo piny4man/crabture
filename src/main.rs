@@ -19,6 +19,7 @@ mod appearance;
 mod overlay;
 mod perf;
 mod render;
+mod scene;
 mod session;
 
 use session::{

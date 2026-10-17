@@ -139,8 +139,8 @@ at least 30 samples. Repeat until each metric has at least 30 samples.
   `run_selection_overlay` with `hud::connect`, `hud::roundtrip`
   (`select::*` for `--select`), `OverlayState::create_overlays`, and the
   `SlotPool::new (surface|configure|draw)` allocations.
-- Draw: `OutputOverlay::{draw, draw_hud}`, `draw_selection`,
-  `draw_window_highlight`, `render::{toolbar_layout, render_toolbar,
+- Draw: `OutputOverlay::{draw, hud_scene}`, `scene::{damage, paint}`,
+  `render::{toolbar_layout, render_toolbar,
   render_button, draw_text, rasterize_icon, blit_argb}`.
 - Selection: `move_selection_rect`, `resize_selection_rect`, and the capture
   crops `selected_area_image`, `selected_window_image`,
