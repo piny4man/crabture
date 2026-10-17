@@ -23,9 +23,11 @@ const PANEL_BORDER_ALPHA: u8 = 30;
 const SEPARATOR_ALPHA: u8 = 28;
 const TEXT_ALPHA: u8 = 236;
 const MUTED_ALPHA: u8 = 150;
-const HOVER_ALPHA: u8 = 22;
+const HOVER_ALPHA: u8 = 36;
 const ACCENT_HINT_ALPHA: u8 = 200;
 const HIGHLIGHT_FILL_ALPHA: u8 = 0x38;
+/// WCAG AA contrast for normal-size text; every HUD text role is below 18 px.
+const MIN_TEXT_CONTRAST: f64 = 4.5;
 const OVERLAY_PIXEL: u32 = 0x9900_0000;
 
 /// Toolbar, icon, and overlay colors after theme/override resolution.
@@ -261,6 +263,7 @@ pub fn resolve_from_toml(
     let colors = if theme.is_none() && !patch_has_colors(&patch) {
         ColorSet::built_in()
     } else {
+        warnings.extend(contrast_warnings(&shared));
         from_shared(&shared)
     };
     Ok(LoadedAppearance {
@@ -381,14 +384,17 @@ fn from_shared(shared: &SharedAppearance) -> ColorSet {
     let [sr, sg, sb] = shared.selection_background.channels();
     let [lr, lg, lb] = shared.selection_foreground.channels();
     let (cr, cg, cb) = contrasting_rgb(ar, ag, ab);
+    let panel = (br, bg, bb);
+    let (text_a, _) = text_alpha((fr, fg, fb), panel, TEXT_ALPHA);
+    let (muted_a, _) = text_alpha((mr, mg, mb), panel, MUTED_ALPHA);
     ColorSet {
         panel_fill: (br, bg, bb, PANEL_FILL_ALPHA),
         panel_border: (fr, fg, fb, PANEL_BORDER_ALPHA),
         separator: (fr, fg, fb, SEPARATOR_ALPHA),
         accent: (ar, ag, ab, 255),
-        text: (fr, fg, fb, TEXT_ALPHA),
-        text_muted: (mr, mg, mb, MUTED_ALPHA),
-        hover: (sr, sg, sb, HOVER_ALPHA),
+        text: (fr, fg, fb, text_a),
+        text_muted: (mr, mg, mb, muted_a),
+        hover: (fr, fg, fb, HOVER_ALPHA),
         icon: (fr, fg, fb),
         selected: (sr, sg, sb, 255),
         selected_label: (lr, lg, lb, 255),
@@ -404,6 +410,70 @@ fn from_shared(shared: &SharedAppearance) -> ColorSet {
             premul(ab, HIGHLIGHT_FILL_ALPHA),
         ),
         highlight_border: pack_argb(255, ar, ag, ab),
+    }
+}
+
+/// Warn about text roles that stay below [`MIN_TEXT_CONTRAST`] on the panel
+/// even when drawn opaque; the colours themselves are kept as configured.
+fn contrast_warnings(shared: &SharedAppearance) -> Vec<String> {
+    let rgb = |c: Rgb| {
+        let [r, g, b] = c.channels();
+        (r, g, b)
+    };
+    let panel = rgb(shared.background);
+    [("colors.foreground", shared.foreground), ("colors.muted", shared.muted)]
+        .into_iter()
+        .filter(|&(_, color)| !text_alpha(rgb(color), panel, 0).1)
+        .map(|(field, color)| {
+            format!(
+                "{field} has {:.1}:1 contrast against colors.background (below {MIN_TEXT_CONTRAST}:1); HUD text may be hard to read",
+                contrast_ratio(rgb(color), panel)
+            )
+        })
+        .collect()
+}
+
+/// WCAG relative luminance of an sRGB colour.
+fn relative_luminance((r, g, b): (u8, u8, u8)) -> f64 {
+    let linear = |c: u8| {
+        let c = f64::from(c) / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+}
+
+/// WCAG contrast ratio between two opaque colours (1.0 ..= 21.0).
+fn contrast_ratio(a: (u8, u8, u8), b: (u8, u8, u8)) -> f64 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+/// `fg` drawn at `alpha` over the opaque `bg`.
+fn blend_over(fg: (u8, u8, u8), alpha: u8, bg: (u8, u8, u8)) -> (u8, u8, u8) {
+    let mix = |f: u8, b: u8| {
+        ((u32::from(f) * u32::from(alpha) + u32::from(b) * u32::from(255 - alpha) + 127) / 255)
+            as u8
+    };
+    (mix(fg.0, bg.0), mix(fg.1, bg.1), mix(fg.2, bg.2))
+}
+
+/// The smallest alpha at which `fg` over `panel` reaches `target` contrast,
+/// or `None` when even opaque `fg` falls short.
+fn min_alpha_for_contrast(fg: (u8, u8, u8), panel: (u8, u8, u8), target: f64) -> Option<u8> {
+    (0..=255u8).find(|&alpha| contrast_ratio(blend_over(fg, alpha, panel), panel) >= target)
+}
+
+/// Text alpha for `fg` on `panel`: `floor`, raised as far as needed to reach
+/// [`MIN_TEXT_CONTRAST`].  The flag is `false` when no alpha reaches it, in
+/// which case the text is drawn opaque.
+fn text_alpha(fg: (u8, u8, u8), panel: (u8, u8, u8), floor: u8) -> (u8, bool) {
+    match min_alpha_for_contrast(fg, panel, MIN_TEXT_CONTRAST) {
+        Some(alpha) => (alpha.max(floor), true),
+        None => (255, false),
     }
 }
 
@@ -581,6 +651,72 @@ family = "JetBrainsMono Nerd Font Mono"
 "##;
 
     #[test]
+    fn contrast_ratio_matches_wcag_extremes() {
+        assert!((contrast_ratio((255, 255, 255), (0, 0, 0)) - 21.0).abs() < 0.01);
+        assert!((contrast_ratio((0, 0, 0), (255, 255, 255)) - 21.0).abs() < 0.01);
+        assert!((contrast_ratio((10, 132, 255), (10, 132, 255)) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sample_theme_muted_text_fails_at_the_old_alpha() {
+        let muted = (0xA4, 0xB8, 0xCF);
+        let panel = (0x10, 0x25, 0x3F);
+        let old = contrast_ratio(blend_over(muted, MUTED_ALPHA, panel), panel);
+        assert!(old < MIN_TEXT_CONTRAST, "{old}");
+        let alpha = min_alpha_for_contrast(muted, panel, MIN_TEXT_CONTRAST).unwrap();
+        assert!(alpha > MUTED_ALPHA);
+        assert!(contrast_ratio(blend_over(muted, alpha, panel), panel) >= MIN_TEXT_CONTRAST);
+        assert!(contrast_ratio(blend_over(muted, alpha - 1, panel), panel) < MIN_TEXT_CONTRAST);
+    }
+
+    #[test]
+    fn built_in_palette_already_passes_and_keeps_its_alphas() {
+        let c = from_shared(&built_in_shared());
+        assert_eq!(c.text_muted.3, MUTED_ALPHA);
+        assert_eq!(c.text.3, TEXT_ALPHA);
+        assert_eq!(
+            text_alpha((235, 235, 245), (32, 32, 36), MUTED_ALPHA),
+            (MUTED_ALPHA, true)
+        );
+    }
+
+    #[test]
+    fn themed_text_alphas_are_raised_to_the_minimum_contrast() {
+        let dir = TempDir::new();
+        write_theme(&dir, "theme.toml", SAMPLE_THEME);
+        let loaded = load(&dir, "[appearance]\ntheme_file = \"theme.toml\"\n");
+        let c = loaded.appearance.colors;
+        let panel = (c.panel_fill.0, c.panel_fill.1, c.panel_fill.2);
+        for role in [c.text, c.text_muted] {
+            let shown = blend_over((role.0, role.1, role.2), role.3, panel);
+            assert!(
+                contrast_ratio(shown, panel) >= MIN_TEXT_CONTRAST,
+                "{role:?}"
+            );
+        }
+        assert!(c.text_muted.3 > MUTED_ALPHA);
+    }
+
+    #[test]
+    fn unreachable_contrast_uses_opaque_text_and_warns() {
+        let loaded = resolve_from_toml(
+            "[colors]\nbackground = \"#404040\"\nmuted = \"#484848\"\n",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(loaded.appearance.colors.text_muted.3, 255);
+        assert!(
+            loaded
+                .warnings
+                .iter()
+                .any(|w| w.contains("colors.muted") && w.contains("contrast")),
+            "{:?}",
+            loaded.warnings
+        );
+    }
+
+    #[test]
     fn font_cache_miss_runs_lookup_and_a_hit_reuses_it() {
         let dir = TempDir::new();
         let file = dir.path().join("crabture").join("font");
@@ -715,7 +851,7 @@ family = "JetBrainsMono Nerd Font Mono"
             loaded.appearance.colors.selected_label,
             (255, 255, 255, 255)
         );
-        assert_eq!(loaded.appearance.colors.hover, (255, 255, 255, 22));
+        assert_eq!(loaded.appearance.colors.hover, (255, 255, 255, 36));
         assert_eq!(loaded.appearance.colors.accent_label, (255, 255, 255, 255));
         assert_eq!(loaded.appearance.colors.highlight_border, 0xFF0A_84FF);
         assert_eq!(loaded.appearance.colors.highlight_fill, 0x3802_1D38);
@@ -739,8 +875,9 @@ theme_file = "theme.toml"
         assert_eq!(c.panel_fill, (0x10, 0x25, 0x3F, 236));
         assert_eq!(c.text, (0xEA, 0xF3, 0xFF, 236));
         assert_eq!(c.accent, (0x80, 0xD4, 0xFF, 255));
-        assert_eq!(c.text_muted, (0xA4, 0xB8, 0xCF, 150));
-        assert_eq!(c.hover, (0x24, 0x4A, 0x70, 22));
+        // Muted alpha is raised from 150 so the theme's muted text reaches 4.5:1.
+        assert_eq!(c.text_muted, (0xA4, 0xB8, 0xCF, 180));
+        assert_eq!(c.hover, (0xEA, 0xF3, 0xFF, 36));
         assert_eq!(c.icon, (0xEA, 0xF3, 0xFF));
         assert_eq!(c.selected, (0x24, 0x4A, 0x70, 255));
         assert_eq!(c.selected_label, (255, 255, 255, 255));
@@ -797,7 +934,7 @@ theme_file = "theme.toml"
         assert_eq!(c.accent, (255, 255, 255, 255));
         assert_eq!(c.accent_label, (0, 0, 0, 255));
         assert_eq!(c.text, (255, 255, 255, TEXT_ALPHA));
-        assert_eq!(c.hover, (0, 0, 255, HOVER_ALPHA));
+        assert_eq!(c.hover, (255, 255, 255, HOVER_ALPHA));
     }
 
     #[test]

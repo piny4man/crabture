@@ -88,23 +88,26 @@ impl Outline {
 }
 
 /// The window-mode crosshair: one horizontal and one vertical line through
-/// `(x, y)`, `radius` pixels each way.
+/// `(x, y)`, `radius` pixels each way and `thickness` pixels wide.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Crosshair {
     pub x: usize,
     pub y: usize,
     pub radius: usize,
+    pub thickness: usize,
     pub color: u32,
 }
 
 impl Crosshair {
     fn lines(&self, width: usize, height: usize) -> [Rect; 2] {
+        let t = self.thickness.max(1);
+        let reach = self.radius.max(t - 1) + 1;
         let horizontal = if self.y < height {
             Rect::new(
                 self.x.saturating_sub(self.radius),
                 self.y,
-                (self.x + self.radius + 1).min(width),
-                self.y + 1,
+                (self.x + reach).min(width),
+                (self.y + t).min(height),
             )
         } else {
             Rect::new(0, 0, 0, 0)
@@ -113,8 +116,8 @@ impl Crosshair {
             Rect::new(
                 self.x,
                 self.y.saturating_sub(self.radius),
-                self.x + 1,
-                (self.y + self.radius + 1).min(height),
+                (self.x + t).min(width),
+                (self.y + reach).min(height),
             )
         } else {
             Rect::new(0, 0, 0, 0)
@@ -124,11 +127,12 @@ impl Crosshair {
 
     fn bounds(&self, width: usize, height: usize) -> Rect {
         let screen = Rect::new(0, 0, width, height);
+        let reach = self.radius.max(self.thickness.max(1) - 1) + 1;
         Rect::new(
             self.x.saturating_sub(self.radius),
             self.y.saturating_sub(self.radius),
-            self.x + self.radius + 1,
-            self.y + self.radius + 1,
+            self.x + reach,
+            self.y + reach,
         )
         .intersect(&screen)
     }
@@ -407,6 +411,7 @@ mod tests {
                     x: 5,
                     y: 150,
                     radius: 18,
+                    thickness: 1,
                     color: BORDER,
                 }),
                 toolbar: toolbar(90, 3),
@@ -417,6 +422,7 @@ mod tests {
                     x: 230,
                     y: 3,
                     radius: 18,
+                    thickness: 2,
                     color: BORDER,
                 }),
                 ..clear

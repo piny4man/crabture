@@ -1108,6 +1108,7 @@ impl OutputOverlay {
                     scaled_rect(self.selection, scale),
                     pw,
                     ph,
+                    scale,
                     appearance.colors.selection_border,
                 ),
                 highlight: None,
@@ -1271,6 +1272,7 @@ impl OutputOverlay {
                 scaled_rect(self.selection, scale),
                 pw,
                 ph,
+                scale,
                 colors.selection_border,
             );
         } else if preferences.mode == CaptureMode::Window {
@@ -1422,13 +1424,14 @@ fn scaled_rect(rect: Option<SelectionRect>, scale: usize) -> Option<SelectionRec
 }
 
 /// The area selection as drawn into a `w`×`h` buffer: a cleared interior with
-/// a 1 px border.  All inputs are physical.
+/// a 1 logical px border.  All inputs are physical.
 fn selection_outline(
     start: Option<(f64, f64)>,
     current: Option<(f64, f64)>,
     selection: Option<SelectionRect>,
     w: usize,
     h: usize,
+    scale: usize,
     border: u32,
 ) -> Option<Outline> {
     let (x, y, width, height) = drawn_selection_rect(start, current, selection)?;
@@ -1442,7 +1445,7 @@ fn selection_outline(
         rect,
         fill: CLEAR_PIXEL,
         border,
-        thickness: 1,
+        thickness: scale.max(1),
     })
 }
 
@@ -1480,6 +1483,7 @@ fn window_target_crosshair(point: (usize, usize), scale: usize, color: u32) -> C
         x: point.0,
         y: point.1,
         radius: 18 * scale,
+        thickness: scale.max(1),
         color,
     }
 }
@@ -2483,15 +2487,42 @@ mod tests {
             25,
             25,
             1,
+            1,
         )
         .unwrap();
         assert_eq!(outline.rect, Rect::new(10, 20, 25, 25));
         assert_eq!((outline.fill, outline.thickness), (CLEAR_PIXEL, 1));
         assert_eq!(
-            selection_outline(None, None, Some((3, 3, 0, 4)), 25, 25, 1),
+            selection_outline(None, None, Some((3, 3, 0, 4)), 25, 25, 1, 1),
             None
         );
-        assert_eq!(selection_outline(None, None, None, 25, 25, 1), None);
+        assert_eq!(selection_outline(None, None, None, 25, 25, 1, 1), None);
+    }
+
+    #[test]
+    fn selection_border_is_one_logical_pixel_at_every_scale() {
+        for scale in [1, 2, 3] {
+            let outline =
+                selection_outline(None, None, Some((10, 10, 40, 40)), 100, 100, scale, 1).unwrap();
+            assert_eq!(outline.thickness, scale, "scale {scale}");
+        }
+    }
+
+    #[test]
+    fn window_target_lines_are_one_logical_pixel_thick() {
+        let border = ColorSet::built_in().selection_border;
+        let pixels = painted(
+            40,
+            40,
+            None,
+            Some(window_target_crosshair((20, 20), 2, border)),
+        );
+        // At scale 2 both arms cover the two physical rows/columns of the
+        // logical pixel at (10, 10).
+        assert_eq!(pixels[21 * 40 + 5], border);
+        assert_eq!(pixels[5 * 40 + 21], border);
+        assert_ne!(pixels[22 * 40 + 5], border);
+        assert_ne!(pixels[5 * 40 + 22], border);
     }
 
     #[test]
@@ -2763,6 +2794,7 @@ mod hotpath_profile {
                 None,
                 pw,
                 ph,
+                scale,
                 0xffff_ffff,
             ),
             highlight: window_highlight_outline((5, 5, 50, 40), pw, ph, scale, 1, 2),
@@ -2776,7 +2808,15 @@ mod hotpath_profile {
             }),
         };
         let after = Scene {
-            selection: selection_outline(None, None, Some((14, 12, 110, 80)), pw, ph, 0xffff_ffff),
+            selection: selection_outline(
+                None,
+                None,
+                Some((14, 12, 110, 80)),
+                pw,
+                ph,
+                scale,
+                0xffff_ffff,
+            ),
             ..before
         };
         let pixmap = toolbar.as_ref().map(|(pixmap, _, _)| pixmap);
