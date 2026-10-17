@@ -21,14 +21,18 @@ text).
 
 | Role | Source | Built-in | Swatches | Finding | Status |
 | --- | --- | --- | --- | --- | --- |
-| Mode label (Area/Window/Screen), `LABEL_PX` 14 | `src/render.rs:33`, `src/render.rs:675` | 14.0:1 | 12.0:1 | Readable. "Full" did not say *what* is full. | **Fixed**: renamed to "Screen" (`src/render.rs:208`). |
-| Chip category (Output/Format/Location), `CAT_PX` 12.5, muted | `src/render.rs:34`, `src/render.rs:727`; alpha `src/appearance.rs:25` | 5.6:1 | **3.6:1** | The theme's muted role at app alpha 150 fails AA, which is the main "hard to read" cause on themed setups. | **Fixed**: `text_alpha` raises muted/foreground alpha per theme until 4.5:1 (`src/appearance.rs:379`). Swatches muted now uses alpha 180 (4.5:1). Built-in stays at 150. |
-| Chip value (Copy/PNG/Screenshots), `VAL_PX` 13.5 | `src/render.rs:35`, `src/render.rs:118`, `src/render.rs:126` | 14.0:1 | 12.0:1 | "Current dir" is jargon, and it is unclear which dir. | **Fixed**: now "This folder". The README explains it is the launch directory. |
-| Shortcut letter (A/W/F/O/P/L), `SHORT_PX` 10.5, muted | `src/render.rs:36`, `src/render.rs:751` | 5.6:1 | 3.6:1 → 4.5:1 | Same contrast fix as the categories. At 10.5 px with no keycap, the letters read as decoration rather than as keys. `P` does not suggest "Format". | Contrast **fixed**. Keycap styling and the `P` mnemonic are **follow-ups**. |
+| Mode label (Area/Window/Screen), `LABEL_PX` 15 | `src/render.rs:33`, `src/render.rs:675` | 14.0:1 | 12.0:1 | Readable. "Full" did not say *what* is full. | **Fixed**: renamed to "Screen" (`src/render.rs:208`). |
+| Chip category (Output/Format/Location), `CAT_PX` 13.5, muted | `src/render.rs:34`, `src/render.rs:727`; alpha `src/appearance.rs:25` | 5.6:1 | **3.6:1** | The theme's muted role at app alpha 150 fails AA, which is the main "hard to read" cause on themed setups. | **Fixed**: `text_alpha` raises muted/foreground alpha per theme until 4.5:1 (`src/appearance.rs:379`). Swatches muted now uses alpha 180 (4.5:1). Built-in stays at 150. |
+| Chip value (Copy/PNG/Screenshots), `VAL_PX` 14.5 | `src/render.rs:35`, `src/render.rs:118`, `src/render.rs:126` | 14.0:1 | 12.0:1 | "Current dir" is jargon, and it is unclear which dir. | **Fixed**: now "This folder". The README explains it is the launch directory. |
+| Shortcut letter (A/W/F/O/P/L), `SHORT_PX` 11.5, muted | `src/render.rs:36`, `src/render.rs:751` | 5.6:1 | 3.6:1 → 4.5:1 | Same contrast fix as the categories. At 11.5 px (was 10.5) with no keycap, the letters read as decoration rather than as keys. `P` does not suggest "Format". | Contrast **fixed**. Keycap styling and the `P` mnemonic are **follow-ups**. |
 | Action hint `esc` (Cancel), muted | `src/render.rs:779` | 5.6:1 | 3.6:1 → 4.5:1 | Same as the shortcut letters. | **Fixed** (contrast). |
 | Action hint ⏎ (Capture) on accent | `src/render.rs:777` | 2.8:1 (white@200 on `#0A84FF`) | 8.6:1 | The bundled Roboto has **no U+23CE glyph** (`bundled_font_has_no_return_symbol_glyph`), so the hint rendered as an empty box or nothing. The built-in hint alpha is also low on the blue accent. | Missing glyph **fixed**: drawn as a vector ↵ (`draw_return_arrow`, `src/render.rs:408`). This works with any font, so no text fallback is needed. Built-in hint contrast is a **follow-up**. |
 | Selected mode label (selection pair) | `src/render.rs:671` | **3.65:1** (white on `#0A84FF`) | 9.2:1 | The built-in selection blue with white text is below AA. That pair is the built-in palette and `selection_*` is theme-owned. | **Follow-up**: a built-in palette change needs its own decision (the contrast enforcement only adjusts app-owned alpha). |
 | Capture label (on-accent) | `src/render.rs:777`; `contrasting_rgb` in `src/appearance.rs` | 3.65:1 | 12.8:1 | Fixed for themes in NUKE-76. The built-in palette has the same white-on-blue issue as the selected label. | **Follow-up** (same as above). |
+
+All toolbar text sizes were also raised by 1 px (label 14 → 15, value
+13.5 → 14.5, category 12.5 → 13.5, shortcut/hint 10.5 → 11.5) so labels are
+easier to read; button height and padding are unchanged.
 
 ## Icons and cues
 

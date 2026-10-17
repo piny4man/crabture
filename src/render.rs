@@ -30,10 +30,10 @@ const GROUP_GAP: f32 = 16.0;
 const BTN_PAD_X: f32 = 12.0;
 const ICON: f32 = 18.0;
 const ICON_GAP: f32 = 8.0;
-const LABEL_PX: f32 = 14.0;
-const CAT_PX: f32 = 12.5;
-const VAL_PX: f32 = 13.5;
-const SHORT_PX: f32 = 10.5;
+const LABEL_PX: f32 = 15.0;
+const CAT_PX: f32 = 13.5;
+const VAL_PX: f32 = 14.5;
+const SHORT_PX: f32 = 11.5;
 const CAT_VAL_GAP: f32 = 6.0;
 const VAL_CUE_GAP: f32 = 6.0;
 const CUE_W: f32 = 7.0;
@@ -977,6 +977,16 @@ mod tests {
                     .any(|&(x, y)| x == min_x && (y as f32 + 0.5 - cy).abs() < scale)
             );
         }
+    }
+
+    #[test]
+    fn text_sizes_are_large_enough_to_read() {
+        assert_eq!(
+            [LABEL_PX, VAL_PX, CAT_PX, SHORT_PX],
+            [15.0, 14.5, 13.5, 11.5]
+        );
+        // Every role still fits inside a button with room to spare.
+        const _: () = assert!(LABEL_PX * 1.5 < BTN_H);
     }
 
     #[test]
