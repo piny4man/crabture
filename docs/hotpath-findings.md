@@ -128,6 +128,29 @@ All of these run one after another on the main thread.
    `$XDG_CACHE_HOME/hyprburst/fonts`. *Expected:* about 9 ms off the open
    whenever a theme or family is set.
 
+   *Result (NUKE-118):* `appearance::resolve_family` caches the family's
+   path in `$XDG_CACHE_HOME/crabture/font`, keyed by the family and the
+   mtimes of the user and system fontconfig caches; a missing, stale or
+   corrupt entry, or a cached file that no longer exists, runs `fc-match`
+   again. An explicit `[font] path` is still tried first. With a warm cache
+   `fc_match_family` is gone from the open report and
+   `load_runtime_appearance` takes 1.4–2.5 ms (was ~10.5 ms). Interleaved A/B
+   against `main` (with NUKE-117), 30 + 30 `--measure` opens per cell, on AC,
+   median / p95:
+
+   | | `main` | branch | p95 drop |
+   |---|---|---|---|
+   | performance cold | 60.1 / 66.5 ms | 60.0 / 60.5 ms | 6.0 ms |
+   | performance warm | 60.4 / 69.0 ms | 52.2 / 52.6 ms | 16.4 ms |
+   | balanced cold | 65.1 / 97.4 ms | 58.4 / 97.7 ms | −0.3 ms |
+   | balanced warm | 68.3 / 98.9 ms | 51.5 / 82.6 ms | 16.3 ms |
+
+   Since NUKE-117 the appearance loads alongside the ~30 ms capture, so the
+   saving only shortens the open when it moves the first frame to an earlier
+   refresh: opens land on ~8.3 ms (120 Hz) steps (52, 60, 68 ms). The
+   balanced cold p95 is set by one slow round (~96 ms) that hit `main` and
+   the branch alike.
+
 4. **Window enumeration spawns `hyprctl` (~8 ms)** (optional part of NUKE-117). It is covered by
    finding 2 if run concurrently. Otherwise, reading the window list from
    Hyprland's IPC socket directly (`$XDG_RUNTIME_DIR/hypr/<sig>/.socket.sock`,

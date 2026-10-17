@@ -12,6 +12,7 @@ use std::{
     env, fmt, fs,
     path::{Path, PathBuf},
     process::Command,
+    time::SystemTime,
 };
 use swatches::{Appearance as SharedAppearance, AppearancePatch, FontFamily, Rgb, Theme};
 
@@ -440,7 +441,7 @@ fn load_font(path: Option<&Path>, family: Option<&str>) -> UiFont {
         return font;
     }
     if let Some(family) = family.filter(|f| !f.is_empty())
-        && let Some(matched) = fc_match_family(family)
+        && let Some(matched) = resolve_family(family)
         && let Some(font) = font_from_path(&matched)
     {
         return font;
@@ -455,6 +456,89 @@ fn font_from_path(path: &Path) -> Option<UiFont> {
     Some(UiFont {
         inner,
         key: FontKey::Path(path.to_path_buf()),
+    })
+}
+
+/// The cache key for a family's resolved path: the family plus the fontconfig
+/// cache directories' `stamps` (mtimes), which `fc-cache` bumps when fonts
+/// are installed or removed.  Always one line.
+fn font_cache_key(family: &str, stamps: &[Option<SystemTime>]) -> String {
+    let stamps: Vec<Option<u128>> = stamps
+        .iter()
+        .map(|t| {
+            Some(
+                t.as_ref()?
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .ok()?
+                    .as_nanos(),
+            )
+        })
+        .collect();
+    // `Debug` escapes control characters, so the key never spans lines.
+    format!("v1 {:?}", (family, stamps))
+}
+
+/// The cached font path in `file` for `key`, or `lookup()` (written back
+/// best-effort) when the cache is missing, stale, corrupt, or names a font
+/// that no longer exists.
+fn cached_font_path(
+    file: &Path,
+    key: &str,
+    lookup: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(path) = read_font_cache(file, key) {
+        return Some(path);
+    }
+    let path = lookup()?;
+    write_font_cache(file, key, &path);
+    Some(path)
+}
+
+fn read_font_cache(file: &Path, key: &str) -> Option<PathBuf> {
+    let text = fs::read_to_string(file).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != key {
+        return None;
+    }
+    let path = PathBuf::from(lines.next().filter(|p| !p.is_empty())?);
+    path.exists().then_some(path)
+}
+
+/// Best effort: a failed write only means the next open runs `fc-match` again.
+fn write_font_cache(file: &Path, key: &str, path: &Path) {
+    let Some(path) = path.to_str().filter(|p| !p.contains('\n')) else {
+        return;
+    };
+    let Some(dir) = file.parent() else {
+        return;
+    };
+    // Write-then-rename so a concurrent open never reads a half-written file.
+    let tmp = file.with_extension(format!("tmp{}", std::process::id()));
+    if fs::create_dir_all(dir).is_ok() && fs::write(&tmp, format!("{key}\n{path}\n")).is_ok() {
+        let _ = fs::rename(&tmp, file);
+    }
+}
+
+/// `family`'s font file, through the on-disk cache in
+/// `$XDG_CACHE_HOME/crabture/font` (else `~/.cache`) so an open does not
+/// spawn `fc-match` while the installed fonts stay the same.
+#[hotpath::measure]
+fn resolve_family(family: &str) -> Option<PathBuf> {
+    let Some(cache) = env::var_os("XDG_CACHE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| Some(PathBuf::from(env::var_os("HOME")?).join(".cache")))
+    else {
+        return fc_match_family(family);
+    };
+    let modified = |path: &Path| fs::metadata(path).ok()?.modified().ok();
+    let stamps = [
+        modified(&cache.join("fontconfig")),
+        modified(Path::new("/var/cache/fontconfig")),
+    ];
+    let key = font_cache_key(family, &stamps);
+    cached_font_path(&cache.join("crabture").join("font"), &key, || {
+        fc_match_family(family)
     })
 }
 
@@ -495,6 +579,90 @@ selection_foreground = "#FFFFFF"
 [font]
 family = "JetBrainsMono Nerd Font Mono"
 "##;
+
+    #[test]
+    fn font_cache_miss_runs_lookup_and_a_hit_reuses_it() {
+        let dir = TempDir::new();
+        let file = dir.path().join("crabture").join("font");
+        let font = dir.path().join("a.ttf");
+        fs::write(&font, b"x").unwrap();
+        let mut calls = 0;
+        let found = cached_font_path(&file, "k", || {
+            calls += 1;
+            Some(font.clone())
+        });
+        assert_eq!(found, Some(font.clone()));
+        assert_eq!(calls, 1);
+        assert_eq!(
+            cached_font_path(&file, "k", || panic!("a cache hit must not run fc-match")),
+            Some(font)
+        );
+    }
+
+    #[test]
+    fn font_cache_with_another_key_is_resolved_again() {
+        let dir = TempDir::new();
+        let file = dir.path().join("font");
+        let (old, new) = (dir.path().join("old.ttf"), dir.path().join("new.ttf"));
+        fs::write(&old, b"x").unwrap();
+        fs::write(&new, b"x").unwrap();
+        cached_font_path(&file, "old", || Some(old.clone()));
+        assert_eq!(
+            cached_font_path(&file, "new", || Some(new.clone())),
+            Some(new.clone())
+        );
+        assert_eq!(
+            cached_font_path(&file, "new", || panic!("the rewritten cache must hit")),
+            Some(new)
+        );
+    }
+
+    #[test]
+    fn a_vanished_cached_font_is_resolved_again() {
+        let dir = TempDir::new();
+        let file = dir.path().join("font");
+        let gone = dir.path().join("gone.ttf");
+        fs::write(&gone, b"x").unwrap();
+        cached_font_path(&file, "k", || Some(gone.clone()));
+        fs::remove_file(&gone).unwrap();
+        let mut called = false;
+        cached_font_path(&file, "k", || {
+            called = true;
+            None
+        });
+        assert!(called);
+    }
+
+    #[test]
+    fn an_empty_or_corrupt_font_cache_is_resolved_again() {
+        for contents in ["", "k\n", "not the key\n/some/font.ttf\n"] {
+            let dir = TempDir::new();
+            let file = dir.path().join("font");
+            fs::write(&file, contents).unwrap();
+            let mut called = false;
+            cached_font_path(&file, "k", || {
+                called = true;
+                None
+            });
+            assert!(called, "{contents:?}");
+        }
+    }
+
+    #[test]
+    fn font_cache_key_tracks_the_family_and_the_fontconfig_stamps() {
+        let t = Some(SystemTime::UNIX_EPOCH);
+        let later = Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1));
+        let base = font_cache_key("Mono", &[t, None]);
+        for other in [
+            font_cache_key("Sans", &[t, None]),
+            font_cache_key("Mono", &[later, None]),
+            font_cache_key("Mono", &[t, t]),
+        ] {
+            assert_ne!(base, other);
+        }
+        assert_eq!(base, font_cache_key("Mono", &[t, None]));
+        assert_eq!(font_cache_key("a\nb", &[t]).lines().count(), 1);
+    }
 
     struct TempDir(PathBuf);
 
