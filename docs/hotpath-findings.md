@@ -100,6 +100,25 @@ All of these run one after another on the main thread.
    returns. *Expected:* the open approaches max(capture, setup) + first
    draw + present, roughly 20 ms off it.
 
+   *Result (NUKE-117):* the capture and `enumerate_window_rects` run on
+   background threads while the main thread loads the appearance, connects,
+   configures the surfaces and paints the first frame. `src/open.rs`'s
+   `OpenGate` holds the first commit until the capture returns: attaching a
+   buffer takes a `CaptureDone` proof only `OpenGate::wait` hands out, and a
+   failed capture closes the HUD unshown. Interleaved A/B against `main`
+   (already with NUKE-116), 30 cold + 30 warm `--measure` opens per cell, on
+   battery (so absolute numbers sit above the AC baseline), median / p95:
+
+   | | `main` | branch | p95 drop |
+   |---|---|---|---|
+   | performance cold | 85.4 / 93.9 ms | 59.8 / 61.0 ms | 32.9 ms |
+   | performance warm | 85.7 / 94.1 ms | 60.3 / 60.9 ms | 33.2 ms |
+   | balanced cold | 147.1 / 151.1 ms | 97.1 / 104.5 ms | 46.6 ms |
+   | balanced warm | 140.2 / 149.1 ms | 98.4 / 99.5 ms | 49.6 ms |
+
+   The window list is still read by spawning `hyprctl -j clients`; it is now
+   off the critical path, so the optional IPC-socket read was left out.
+
 3. **`fc-match` is spawned on every open (9–11 ms)** (NUKE-118). The shared theme always
    sets a font family, so `load_font` resolves it through
    `fc-match -f %{file}` on every open, even though the answer only changes

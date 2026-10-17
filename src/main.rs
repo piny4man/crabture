@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use arboard::{Clipboard, ImageData};
 use clap::Parser;
 use dialoguer::{Input, Select, theme::ColorfulTheme};
@@ -9,19 +9,21 @@ use std::{
     path::{Path, PathBuf},
     process::{self, Command},
     sync::OnceLock,
-    thread::sleep,
+    thread::{self, sleep},
     time::Duration,
 };
 use time::OffsetDateTime;
 use xcap::{Monitor, Window};
 
 mod appearance;
+mod open;
 mod overlay;
 mod perf;
 mod render;
 mod scene;
 mod session;
 
+use open::OpenGate;
 use session::{
     AreaSelection, CaptureSession, FullScreenSelection, GraphicalFormat, GraphicalPreferences,
     OutputDestination, SaveLocationChoice, SessionOutcome, WindowSelection,
@@ -296,24 +298,34 @@ fn cli_intent(cli: &Cli) -> CliIntent {
 /// flag) the full open path runs, then the HUD cancels itself once it is on
 /// screen, so nothing is captured, saved, or copied.
 fn run_graphical_screenshot_ui(measure: bool) -> Result<()> {
-    let preferences = load_graphical_preferences().unwrap_or_default();
-    let appearance = load_runtime_appearance();
-    let mut session = CaptureSession::with_preferences(preferences);
-
     // Freeze every output at physical resolution *before* showing the overlay.
     // This guarantees the toolbar can never appear in a capture (the leak fix),
     // and lets window/area captures crop from a physical-resolution source
-    // instead of re-capturing at logical resolution.
-    let snapshots = capture_all_outputs()?;
+    // instead of re-capturing at logical resolution.  The capture runs in the
+    // background while the rest of the open path sets up the overlay; the
+    // gate holds the overlay's first commit until it has returned.
+    let (mut gate, signal) = OpenGate::new();
+    let capture = thread::spawn(move || {
+        let snapshots = capture_all_outputs();
+        signal.finish(snapshots.is_ok());
+        snapshots
+    });
 
     // Enumerate on-screen windows (global logical rects, in capture-selection
     // order) so the overlay can highlight the window the pointer is over in
     // window mode.  Best-effort: an empty list just means no highlight.
-    let window_rects = enumerate_window_rects();
+    gate.set_window_rects(thread::spawn(enumerate_window_rects));
 
-    let command =
-        overlay::run_screenshot_hud(session.preferences(), window_rects, appearance, measure)
-            .context("graphical UI failed")?;
+    let preferences = load_graphical_preferences().unwrap_or_default();
+    let appearance = load_runtime_appearance();
+    let mut session = CaptureSession::with_preferences(preferences);
+
+    let hud = overlay::run_screenshot_hud(session.preferences(), gate, appearance, measure);
+    // A failed capture closes the HUD before it shows; report that first.
+    let snapshots = capture
+        .join()
+        .map_err(|_| anyhow!("screen capture panicked"))??;
+    let command = hud.context("graphical UI failed")?;
 
     match session.handle(command) {
         SessionOutcome::Continue => Ok(()),
