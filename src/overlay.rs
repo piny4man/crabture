@@ -7,6 +7,7 @@
 //! Pointer click-drag selects the area; Escape or right-click cancels.
 
 use crate::appearance::{Appearance, ColorSet, FontKey};
+use crate::perf::{self, InputKind, InputProbe, OpenProbe};
 use crate::render;
 use crate::session::{
     AreaSelection, CaptureMode, FullScreenSelection, GraphicalPreferences, SessionCommand,
@@ -36,13 +37,18 @@ use smithay_client_toolkit::{
     },
     shm::{Shm, ShmHandler, slot::SlotPool},
 };
+use std::time::Instant;
 use wayland_client::{
-    Connection, QueueHandle,
-    globals::registry_queue_init,
+    Connection, Dispatch, QueueHandle,
+    globals::{GlobalList, registry_queue_init},
     protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
 };
 use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::{
     Shape, WpCursorShapeDeviceV1,
+};
+use wayland_protocols::wp::presentation_time::client::{
+    wp_presentation::{self, WpPresentation},
+    wp_presentation_feedback::{self, WpPresentationFeedback},
 };
 
 /// Selection area: fully transparent so desktop shows through.
@@ -102,6 +108,7 @@ fn clamp_selection_rect(rect: SelectionRect, surface_size: (u32, u32)) -> Select
     (x, y, w, h)
 }
 
+#[hotpath::measure]
 fn move_selection_rect(
     rect: SelectionRect,
     delta: (i32, i32),
@@ -113,6 +120,7 @@ fn move_selection_rect(
     (x, y, rect.2, rect.3)
 }
 
+#[hotpath::measure]
 fn resize_selection_rect(
     rect: SelectionRect,
     handle: ResizeHandle,
@@ -303,10 +311,14 @@ fn shortcut_session_command(
 /// `selection` is `Some((x, y, w, h))` in logical surface coordinates, or
 /// `None` if cancelled.  `output_name` identifies which monitor the overlay
 /// appeared on (e.g. `"eDP-1"`).
+#[hotpath::measure]
 pub fn run_selection_overlay(appearance: Appearance) -> Result<OverlayResult> {
-    let conn = Connection::connect_to_env().context("failed to connect to Wayland")?;
-    let (globals, mut event_queue) =
-        registry_queue_init(&conn).context("failed to initialise Wayland registry")?;
+    let (conn, globals, mut event_queue) = hotpath::measure_block!("select::connect", {
+        let conn = Connection::connect_to_env().context("failed to connect to Wayland")?;
+        let (globals, event_queue) =
+            registry_queue_init(&conn).context("failed to initialise Wayland registry")?;
+        (conn, globals, event_queue)
+    });
     let qh = event_queue.handle();
 
     let compositor = CompositorState::bind(&globals, &qh).context("wl_compositor not available")?;
@@ -315,6 +327,8 @@ pub fn run_selection_overlay(appearance: Appearance) -> Result<OverlayResult> {
 
     // Optional: cursor shape protocol (not all compositors support it).
     let cursor_shape_manager = CursorShapeManager::bind(&globals, &qh).ok();
+
+    let perf = PerfState::new(&globals, &qh, "select", false);
 
     let mut state = OverlayState {
         registry_state: RegistryState::new(&globals),
@@ -335,15 +349,19 @@ pub fn run_selection_overlay(appearance: Appearance) -> Result<OverlayResult> {
         appearance,
         hud_result: None,
         selection_result: None,
+        perf,
         exit: false,
         cancelled: false,
     };
 
     // Output geometry isn't available synchronously: pump the queue once so the
     // registry/xdg-output events populate OutputState before we place surfaces.
-    event_queue
-        .roundtrip(&mut state)
-        .context("Wayland roundtrip error")?;
+    hotpath::measure_block!(
+        "select::roundtrip",
+        event_queue
+            .roundtrip(&mut state)
+            .context("Wayland roundtrip error")?
+    );
     state.create_overlays(&qh, "crabture-select");
 
     loop {
@@ -369,20 +387,29 @@ pub fn run_selection_overlay(appearance: Appearance) -> Result<OverlayResult> {
     Ok(result)
 }
 
+/// Run the screenshot HUD and return the session command it ended with.  With
+/// `measure`, the HUD cancels itself once its first frame with content has
+/// been presented (the `--measure` open benchmark).
+#[hotpath::measure]
 pub fn run_screenshot_hud(
     default_preferences: GraphicalPreferences,
     window_rects: Vec<(i32, i32, u32, u32)>,
     appearance: Appearance,
+    measure: bool,
 ) -> Result<SessionCommand> {
-    let conn = Connection::connect_to_env().context("failed to connect to Wayland")?;
-    let (globals, mut event_queue) =
-        registry_queue_init(&conn).context("failed to initialise Wayland registry")?;
+    let (conn, globals, mut event_queue) = hotpath::measure_block!("hud::connect", {
+        let conn = Connection::connect_to_env().context("failed to connect to Wayland")?;
+        let (globals, event_queue) =
+            registry_queue_init(&conn).context("failed to initialise Wayland registry")?;
+        (conn, globals, event_queue)
+    });
     let qh = event_queue.handle();
 
     let compositor = CompositorState::bind(&globals, &qh).context("wl_compositor not available")?;
     let layer_shell = LayerShell::bind(&globals, &qh).context("wlr-layer-shell not available")?;
     let shm = Shm::bind(&globals, &qh).context("wl_shm not available")?;
     let cursor_shape_manager = CursorShapeManager::bind(&globals, &qh).ok();
+    let perf = PerfState::new(&globals, &qh, "hud", measure);
 
     let mut state = OverlayState {
         registry_state: RegistryState::new(&globals),
@@ -403,15 +430,19 @@ pub fn run_screenshot_hud(
         appearance,
         hud_result: None,
         selection_result: None,
+        perf,
         exit: false,
         cancelled: false,
     };
 
     // Output geometry isn't available synchronously: pump the queue once so the
     // registry/xdg-output events populate OutputState before we place surfaces.
-    event_queue
-        .roundtrip(&mut state)
-        .context("Wayland roundtrip error")?;
+    hotpath::measure_block!(
+        "hud::roundtrip",
+        event_queue
+            .roundtrip(&mut state)
+            .context("Wayland roundtrip error")?
+    );
     state.create_overlays(&qh, "crabture-hud");
 
     loop {
@@ -444,6 +475,112 @@ fn teardown_layer_surface(conn: &Connection, layer: &LayerSurface) {
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
+
+/// `CRABTURE_PERF` / `--measure` bookkeeping.  The overlay holds `None` when
+/// both are off, so it then behaves exactly as without the probe.
+struct PerfState {
+    /// Surface label in sample lines: `hud` or `select`.
+    surface: &'static str,
+    /// Print samples (`CRABTURE_PERF`).  `--measure` alone only needs the open
+    /// probe to know when to exit.
+    emit: bool,
+    /// Cancel the session once content has been presented (`--measure`).
+    measure: bool,
+    /// Presentation-time feedback; `None` falls back to frame callbacks.
+    presentation: Option<WpPresentation>,
+    input: InputProbe,
+    open: OpenProbe,
+}
+
+/// What a committed frame waits to have timed when it is presented.
+#[derive(Clone, Copy, Debug)]
+struct FrameSample {
+    /// The input this frame answers, with when it arrived.
+    input: Option<(InputKind, Instant)>,
+    /// Whether this frame drew the overlay's content (see [`OpenProbe`]).
+    content: bool,
+    /// Whether the open probe was still waiting when this frame was committed.
+    open: bool,
+}
+
+impl FrameSample {
+    /// Fold a newer commit into this one when both wait on the same frame
+    /// callback: the newer frame is the one presented, and it answers the
+    /// older input too.
+    fn merge(self, newer: Self) -> Self {
+        Self {
+            input: self.input.or(newer.input),
+            content: self.content || newer.content,
+            open: self.open || newer.open,
+        }
+    }
+}
+
+impl PerfState {
+    fn new(
+        globals: &GlobalList,
+        qh: &QueueHandle<OverlayState>,
+        surface: &'static str,
+        measure: bool,
+    ) -> Option<Self> {
+        let emit = perf::enabled();
+        if !emit && !measure {
+            return None;
+        }
+        Some(Self {
+            surface,
+            emit,
+            measure,
+            presentation: globals.bind(qh, 1..=1, ()).ok(),
+            input: InputProbe::default(),
+            open: OpenProbe::default(),
+        })
+    }
+
+    fn report(&self, metric: &str, elapsed: std::time::Duration) {
+        if self.emit {
+            perf::emit(metric, self.surface, elapsed);
+        }
+    }
+
+    /// Record an input whose effect should show in the next changed frame.
+    fn input(&mut self, kind: InputKind) {
+        if let Some((expired, age)) = self.input.input(kind, Instant::now()) {
+            self.report(expired.unanswered_metric(), age);
+        }
+    }
+
+    /// A frame is being committed: the sample it carries to presentation, or
+    /// `None` when nothing waits on it.
+    fn commit(&mut self, changed: bool, content: bool) -> Option<FrameSample> {
+        let input = if changed { self.input.take() } else { None };
+        let open = !self.open.done();
+        (input.is_some() || open).then_some(FrameSample {
+            input,
+            content,
+            open,
+        })
+    }
+
+    /// A frame carrying `sample` was presented at `at`.  Returns `true` when
+    /// `--measure` is done.
+    fn presented(&mut self, sample: FrameSample, at: Instant) -> bool {
+        if let Some((kind, since)) = sample.input {
+            self.report(kind.metric(), at.saturating_duration_since(since));
+        }
+        if sample.open {
+            let since_start = at.saturating_duration_since(perf::start());
+            let samples = self.open.presented(sample.content, since_start);
+            if let Some(elapsed) = samples.first_present {
+                self.report("first-present", elapsed);
+            }
+            if let Some(elapsed) = samples.first_content_present {
+                self.report("first-content-present", elapsed);
+            }
+        }
+        self.measure && self.open.done()
+    }
+}
 
 /// A toolbar pixmap together with the inputs it was rendered for, so we can
 /// reuse it across frames and only re-rasterize when something actually
@@ -505,6 +642,12 @@ struct OutputOverlay {
     /// True when we've requested a frame callback and are waiting for it.
     frame_pending: bool,
     first_configure: bool,
+
+    /// What the last committed frame showed (probe only).
+    last_frame: Option<FrameKey>,
+    /// Probe sample timed by the next frame callback, when the compositor
+    /// has no presentation-time feedback.
+    pending_sample: Option<FrameSample>,
 }
 
 struct OverlayState {
@@ -539,6 +682,7 @@ struct OverlayState {
     /// Result of the legacy `--select` overlay: the completed selection, its
     /// output's surface size, and that output's name.
     selection_result: Option<OverlayResult>,
+    perf: Option<PerfState>,
     exit: bool,
     cancelled: bool,
 }
@@ -547,6 +691,7 @@ impl OverlayState {
     /// Create one layer-shell overlay surface per Wayland output so the capture
     /// UI spans every monitor.  Falls back to a single compositor-placed surface
     /// when no outputs are known (degrading to the old single-monitor behavior).
+    #[hotpath::measure(impl_type = "OverlayState")]
     fn create_overlays(&mut self, qh: &QueueHandle<Self>, namespace: &str) {
         let outputs: Vec<wl_output::WlOutput> = self.output_state.outputs().collect();
         if outputs.is_empty() {
@@ -567,7 +712,10 @@ impl OverlayState {
         namespace: &str,
         output: Option<wl_output::WlOutput>,
     ) {
-        let pool = match SlotPool::new(1024, &self.shm) {
+        let pool = match hotpath::measure_block!(
+            "SlotPool::new (surface)",
+            SlotPool::new(1024, &self.shm)
+        ) {
             Ok(p) => p,
             Err(_) => return,
         };
@@ -619,6 +767,8 @@ impl OverlayState {
             dirty: false,
             frame_pending: false,
             first_configure: true,
+            last_frame: None,
+            pending_sample: None,
         });
     }
 
@@ -663,8 +813,57 @@ impl OverlayState {
         let preferences = self.preferences;
         let appearance = &self.appearance;
         let hud_active = self.hud_active;
+        let perf = self.perf.as_mut();
         if let Some(ov) = self.overlays.get_mut(idx) {
-            ov.draw(qh, shm, preferences, appearance, hud_active, is_active);
+            ov.draw(
+                qh,
+                shm,
+                preferences,
+                appearance,
+                hud_active,
+                is_active,
+                perf,
+            );
+        }
+    }
+
+    /// What overlay `idx` would draw now, for the probe's visible-change rule.
+    fn frame_key(&self, idx: usize) -> FrameKey {
+        let is_active = self.active_index() == Some(idx);
+        self.overlays[idx].frame_key(self.preferences, self.hud_active, is_active)
+    }
+
+    /// Record an input for the probe (no-op when it is off).
+    fn perf_input(&mut self, kind: InputKind) {
+        if let Some(perf) = &mut self.perf {
+            perf.input(kind);
+        }
+    }
+
+    /// A frame carrying `sample` was presented.
+    fn perf_presented(&mut self, sample: FrameSample) {
+        let at = Instant::now();
+        if let Some(perf) = &mut self.perf
+            && perf.presented(sample, at)
+        {
+            self.cancelled = true;
+            self.exit = true;
+        }
+    }
+
+    /// The compositor dropped a frame carrying `sample` for a newer commit.  An
+    /// input it carried is answered by that newer frame but no longer timed;
+    /// an open still waiting gets another frame so `--measure` cannot stall.
+    fn perf_discarded(&mut self, sample: FrameSample, qh: &QueueHandle<Self>) {
+        if !sample.open || self.perf.as_ref().is_none_or(|p| p.open.done()) {
+            return;
+        }
+        if let Some(idx) = self.active_index() {
+            if self.overlays[idx].frame_pending {
+                self.overlays[idx].dirty = true;
+            } else {
+                self.redraw(idx, qh);
+            }
         }
     }
 
@@ -787,6 +986,32 @@ impl OutputOverlay {
         }
     }
 
+    /// What this overlay draws with the given session state.
+    fn frame_key(
+        &self,
+        preferences: GraphicalPreferences,
+        hud_active: bool,
+        is_active: bool,
+    ) -> FrameKey {
+        let scale = self.buffer_scale.max(1);
+        let s = scale as usize;
+        FrameKey {
+            size: (self.surface_w, self.surface_h, scale),
+            hud: hud_active.then_some(preferences),
+            selection: drawn_selection_rect(
+                scaled_point(self.start, s),
+                scaled_point(self.current, s),
+                scaled_rect(self.selection, s),
+            ),
+            window_highlight: self.highlighted_window,
+            window_target: self.window_target,
+            toolbar: (hud_active && is_active).then_some(self.hovered_button),
+        }
+        .visible()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[hotpath::measure(impl_type = "OutputOverlay")]
     fn draw(
         &mut self,
         qh: &QueueHandle<OverlayState>,
@@ -795,6 +1020,7 @@ impl OutputOverlay {
         appearance: &Appearance,
         hud_active: bool,
         is_active: bool,
+        perf: Option<&mut PerfState>,
     ) {
         let scale = self.buffer_scale.max(1) as usize;
         let lw = self.surface_w as usize;
@@ -810,7 +1036,7 @@ impl OutputOverlay {
 
         let needed = pw * ph * 4;
         if self.pool.len() < needed {
-            match SlotPool::new(needed, shm) {
+            match hotpath::measure_block!("SlotPool::new (draw)", SlotPool::new(needed, shm)) {
                 Ok(p) => self.pool = p,
                 Err(_) => return,
             }
@@ -869,10 +1095,32 @@ impl OutputOverlay {
             .frame(qh, self.layer.wl_surface().clone());
         self.frame_pending = true;
 
+        if let Some(perf) = perf {
+            let key = self.frame_key(preferences, hud_active, is_active);
+            let changed = self.last_frame.replace(key) != Some(key);
+            // Only the active output composites the HUD toolbar; the legacy
+            // overlay has no toolbar, so any of its frames is content.
+            let content = !hud_active || is_active;
+            if let Some(sample) = perf.commit(changed, content) {
+                match &perf.presentation {
+                    Some(presentation) => {
+                        presentation.feedback(self.layer.wl_surface(), qh, sample);
+                    }
+                    None => {
+                        self.pending_sample = Some(match self.pending_sample.take() {
+                            Some(older) => older.merge(sample),
+                            None => sample,
+                        });
+                    }
+                }
+            }
+        }
+
         self.layer.commit();
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[hotpath::measure(impl_type = "OutputOverlay")]
     fn draw_hud(
         &mut self,
         pixels: &mut [u32],
@@ -973,6 +1221,60 @@ impl OutputOverlay {
     }
 }
 
+/// What one overlay frame shows, for the `CRABTURE_PERF` probe: only a frame
+/// whose key differs from the last committed one answers a pending input.
+/// Build it from the raw overlay state, then call [`FrameKey::visible`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FrameKey {
+    /// Logical surface size and buffer scale.
+    size: (u32, u32, i32),
+    /// HUD preferences; `None` for the legacy `--select` overlay.
+    hud: Option<GraphicalPreferences>,
+    /// The selection rectangle as drawn, in physical pixels.
+    selection: Option<SelectionRect>,
+    window_highlight: Option<(i32, i32, u32, u32)>,
+    window_target: Option<(u32, u32)>,
+    /// `Some(hovered button)` when this output composites the toolbar.
+    toolbar: Option<Option<usize>>,
+}
+
+impl FrameKey {
+    /// Drop every field this frame does not draw, so two keys compare equal
+    /// exactly when their frames look the same.
+    fn visible(self) -> Self {
+        let mode = self.hud.map(|prefs| prefs.mode);
+        let draws_selection = matches!(mode, None | Some(CaptureMode::Area));
+        let window_mode = mode == Some(CaptureMode::Window);
+        let window_highlight = self.window_highlight.filter(|_| window_mode);
+        Self {
+            selection: self
+                .selection
+                .filter(|&(_, _, w, h)| draws_selection && w > 0 && h > 0),
+            window_highlight,
+            // The crosshair is drawn only when no window is highlighted.
+            window_target: self
+                .window_target
+                .filter(|_| window_mode && window_highlight.is_none()),
+            toolbar: self.toolbar.filter(|_| self.hud.is_some()),
+            ..self
+        }
+    }
+}
+
+/// The selection rectangle `draw_selection` paints: the in-progress drag when
+/// there is one, else the committed selection.  All inputs are physical.
+fn drawn_selection_rect(
+    start: Option<(f64, f64)>,
+    current: Option<(f64, f64)>,
+    selection: Option<SelectionRect>,
+) -> Option<SelectionRect> {
+    if let (Some(start), Some(cur)) = (start, current) {
+        Some(selection_rect_from_drag(start, cur))
+    } else {
+        selection
+    }
+}
+
 /// Scale an optional logical point into physical pixel coordinates.
 fn scaled_point(point: Option<(f64, f64)>, scale: usize) -> Option<(f64, f64)> {
     point.map(|(x, y)| (x * scale as f64, y * scale as f64))
@@ -1009,6 +1311,7 @@ fn window_rect_at_point(
 /// solid accent border.  `rect` is in surface-local logical coordinates (its
 /// origin may be negative if the window extends off the output's top/left); it
 /// is scaled to physical pixels and clamped to the buffer.
+#[hotpath::measure]
 fn draw_window_highlight(
     pixels: &mut [u32],
     w: usize,
@@ -1084,6 +1387,7 @@ fn draw_window_target(
     }
 }
 
+#[hotpath::measure]
 fn draw_selection(
     pixels: &mut [u32],
     w: usize,
@@ -1093,13 +1397,7 @@ fn draw_selection(
     selection: Option<SelectionRect>,
     border: u32,
 ) {
-    let rect = if let (Some(start), Some(cur)) = (start, current) {
-        Some(selection_rect_from_drag(start, cur))
-    } else {
-        selection
-    };
-
-    if let Some((x, y, width, height)) = rect {
+    if let Some((x, y, width, height)) = drawn_selection_rect(start, current, selection) {
         let x1 = (x as usize).min(w.saturating_sub(1));
         let y1 = (y as usize).min(h.saturating_sub(1));
         let x2 = (x as usize + width as usize).min(w);
@@ -1172,6 +1470,9 @@ impl CompositorHandler for OverlayState {
     ) {
         if let Some(idx) = self.index_for_surface(surface) {
             self.overlays[idx].frame_pending = false;
+            if let Some(sample) = self.overlays[idx].pending_sample.take() {
+                self.perf_presented(sample);
+            }
             if self.overlays[idx].dirty {
                 self.overlays[idx].dirty = false;
                 self.redraw(idx, qh);
@@ -1279,7 +1580,8 @@ impl LayerShellHandler for OverlayState {
             let scale = ov.buffer_scale.max(1) as usize;
             let needed = (ov.surface_w as usize * scale) * (ov.surface_h as usize * scale) * 4;
             if ov.pool.len() < needed
-                && let Ok(p) = SlotPool::new(needed, shm)
+                && let Ok(p) =
+                    hotpath::measure_block!("SlotPool::new (configure)", SlotPool::new(needed, shm))
             {
                 ov.pool = p;
             }
@@ -1399,6 +1701,7 @@ impl KeyboardHandler for OverlayState {
                 self.exit = true;
             }
             Keysym::space if self.preferences.mode == CaptureMode::Area => {
+                self.perf_input(InputKind::Key);
                 self.preferences.mode = CaptureMode::Window;
                 for ov in &mut self.overlays {
                     ov.selection = None;
@@ -1414,6 +1717,7 @@ impl KeyboardHandler for OverlayState {
                     self.active_output_name(),
                     self.preferences,
                 ) {
+                    self.perf_input(InputKind::Key);
                     self.apply_hud_command(command, qh);
                 }
             }
@@ -1474,6 +1778,12 @@ impl PointerHandler for OverlayState {
             let lx = event.position.0;
             let ly = event.position.1;
 
+            // Probe: a motion counts as an input only when it changes what
+            // its overlay draws, judged by comparing frame keys around it.
+            let motion_before = (self.perf.is_some()
+                && matches!(event.kind, PointerEventKind::Motion { .. }))
+            .then(|| (self.frame_key(idx), self.overlays[idx].selecting));
+
             match event.kind {
                 PointerEventKind::Enter { serial } => {
                     // Set crosshair cursor when entering the overlay surface.
@@ -1504,6 +1814,7 @@ impl PointerHandler for OverlayState {
                             );
                             if let Some(button_idx) = render::button_at(&layout, lx, ly) {
                                 let command = layout.swap_remove(button_idx).command;
+                                self.perf_input(InputKind::HudPress);
                                 self.apply_hud_command(command, qh);
                                 return;
                             }
@@ -1657,6 +1968,22 @@ impl PointerHandler for OverlayState {
                 }
                 _ => {}
             }
+
+            if let Some((before, selecting)) = motion_before {
+                let after = self.frame_key(idx);
+                if after != before {
+                    let kind = if selecting && self.hud_active {
+                        InputKind::AreaDrag
+                    } else if selecting {
+                        InputKind::SelectDrag
+                    } else if after.toolbar != before.toolbar {
+                        InputKind::HudHover
+                    } else {
+                        InputKind::WindowHighlight
+                    };
+                    self.perf_input(kind);
+                }
+            }
         }
 
         if let Some(idx) = pending_redraw {
@@ -1665,6 +1992,37 @@ impl PointerHandler for OverlayState {
                 self.overlays[idx].dirty = false;
                 self.redraw(idx, qh);
             }
+        }
+    }
+}
+
+impl Dispatch<WpPresentation, ()> for OverlayState {
+    fn event(
+        _: &mut Self,
+        _: &WpPresentation,
+        _: wp_presentation::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WpPresentationFeedback, FrameSample> for OverlayState {
+    fn event(
+        state: &mut Self,
+        _: &WpPresentationFeedback,
+        event: wp_presentation_feedback::Event,
+        sample: &FrameSample,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        // Stamped on arrival: the event's own timestamp is in the
+        // compositor's clock, which `Instant` cannot be built from.
+        match event {
+            wp_presentation_feedback::Event::Presented { .. } => state.perf_presented(*sample),
+            wp_presentation_feedback::Event::Discarded => state.perf_discarded(*sample, qh),
+            _ => {}
         }
     }
 }
@@ -1699,6 +2057,125 @@ impl ProvidesRegistryState for OverlayState {
 mod tests {
     use super::*;
     use crate::session::{OutputDestination, SaveLocationChoice};
+
+    fn hud_key(mode: CaptureMode) -> FrameKey {
+        FrameKey {
+            size: (800, 600, 2),
+            hud: Some(GraphicalPreferences {
+                mode,
+                ..GraphicalPreferences::default()
+            }),
+            selection: Some((10, 10, 40, 40)),
+            window_highlight: Some((0, 0, 100, 100)),
+            window_target: Some((5, 5)),
+            toolbar: Some(None),
+        }
+    }
+
+    #[test]
+    fn frame_key_ignores_what_area_mode_does_not_draw() {
+        let key = hud_key(CaptureMode::Area);
+        let moved = FrameKey {
+            window_highlight: Some((1, 1, 100, 100)),
+            window_target: Some((6, 6)),
+            ..key
+        };
+        assert_eq!(key.visible(), moved.visible());
+
+        // A press before any drag has a zero-area rect, which draws nothing.
+        let pressed = FrameKey {
+            selection: Some((30, 30, 0, 0)),
+            ..key
+        };
+        let cleared = FrameKey {
+            selection: None,
+            ..key
+        };
+        assert_eq!(pressed.visible(), cleared.visible());
+
+        let resized = FrameKey {
+            selection: Some((10, 10, 41, 40)),
+            ..key
+        };
+        assert_ne!(key.visible(), resized.visible());
+    }
+
+    #[test]
+    fn frame_key_window_mode_draws_the_target_only_without_a_highlight() {
+        let key = hud_key(CaptureMode::Window);
+        let other_selection = FrameKey {
+            selection: None,
+            ..key
+        };
+        assert_eq!(key.visible(), other_selection.visible());
+
+        let moved_target = FrameKey {
+            window_target: Some((7, 7)),
+            ..key
+        };
+        assert_eq!(key.visible(), moved_target.visible());
+
+        let no_highlight = FrameKey {
+            window_highlight: None,
+            ..key
+        };
+        let no_highlight_moved = FrameKey {
+            window_target: Some((7, 7)),
+            ..no_highlight
+        };
+        assert_ne!(no_highlight.visible(), no_highlight_moved.visible());
+
+        let new_highlight = FrameKey {
+            window_highlight: Some((50, 0, 100, 100)),
+            ..key
+        };
+        assert_ne!(key.visible(), new_highlight.visible());
+    }
+
+    #[test]
+    fn frame_key_full_screen_mode_draws_only_the_toolbar() {
+        let key = hud_key(CaptureMode::FullScreen);
+        let bare = FrameKey {
+            selection: None,
+            window_highlight: None,
+            window_target: None,
+            ..key
+        };
+        assert_eq!(key.visible(), bare.visible());
+
+        let hovered = FrameKey {
+            toolbar: Some(Some(2)),
+            ..key
+        };
+        assert_ne!(key.visible(), hovered.visible());
+    }
+
+    #[test]
+    fn frame_key_legacy_select_draws_only_the_selection() {
+        let key = FrameKey {
+            hud: None,
+            toolbar: None,
+            ..hud_key(CaptureMode::Area)
+        };
+        let moved = FrameKey {
+            window_highlight: None,
+            window_target: Some((9, 9)),
+            ..key
+        };
+        assert_eq!(key.visible(), moved.visible());
+    }
+
+    #[test]
+    fn drawn_selection_prefers_the_drag_in_progress() {
+        assert_eq!(
+            drawn_selection_rect(Some((30.0, 30.0)), Some((10.0, 20.0)), Some((0, 0, 5, 5))),
+            Some((10, 20, 20, 10))
+        );
+        assert_eq!(
+            drawn_selection_rect(None, None, Some((0, 0, 5, 5))),
+            Some((0, 0, 5, 5))
+        );
+    }
 
     #[test]
     fn normalizes_selection_drag_from_any_direction() {
@@ -2107,5 +2584,118 @@ mod tests {
                 preferences,
             )
         );
+    }
+}
+
+/// The opt-in `hotpath` build profiles the overlay's open and feedback paths.
+///
+/// Compiled only with `--features hotpath`: drives everything that runs
+/// without a compositor (appearance and font resolution, toolbar layout and
+/// rasterisation, canvas drawing, selection math, the area crop) under a
+/// profiling guard and checks the report names each phase, so an
+/// instrumentation attribute lost in a refactor fails here instead of
+/// silently thinning the next profiling run.  The Wayland-bound spans
+/// (`OutputOverlay::draw`, `run_*`, capture) are checked by a live `--measure`
+/// run; see docs/hotpath-profiling.md.
+#[cfg(all(test, feature = "hotpath"))]
+mod hotpath_profile {
+    use super::*;
+    use crate::{LogicalOutput, OutputSnapshot};
+
+    #[test]
+    fn the_report_names_every_offscreen_phase() {
+        let dir = std::env::temp_dir().join(format!("crabture-hotpath-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let report = dir.join("report.json");
+        let config = dir.join("appearance.toml");
+        // A missing font path and an unknown family walk the whole fallback
+        // chain: path, fontconfig, bundled font.
+        std::fs::write(
+            &config,
+            "[font]\nfamily = \"Crabture Missing Family\"\npath = \"/nonexistent/font.ttf\"\n",
+        )
+        .unwrap();
+
+        let guard = hotpath::HotpathGuardBuilder::new("hotpath_profile")
+            .format(hotpath::Format::Json)
+            .output_path(&report)
+            .functions_limit(0)
+            .build();
+
+        let appearance = crate::appearance::load_from_path(&config, None).appearance;
+        let _ = Appearance::bundled();
+
+        let (lw, lh, scale) = (320usize, 200usize, 2usize);
+        let (pw, ph) = (lw * scale, lh * scale);
+        let mut pixels = vec![0u32; pw * ph];
+        let prefs = GraphicalPreferences::default();
+        let layout = render::toolbar_layout(lw, lh, prefs, &appearance);
+        if let Some((pixmap, ox, oy)) =
+            render::render_toolbar(&layout, prefs, &appearance, scale, Some(0))
+        {
+            render::blit_argb(&mut pixels, pw, ph, &pixmap, ox, oy);
+        }
+        draw_selection(
+            &mut pixels,
+            pw,
+            ph,
+            Some((10.0, 10.0)),
+            Some((120.0, 90.0)),
+            None,
+            0xffff_ffff,
+        );
+        draw_window_highlight(&mut pixels, pw, ph, (5, 5, 50, 40), scale, 1, 2);
+
+        let rect = move_selection_rect((10, 10, 40, 40), (5, -3), (lw as u32, lh as u32));
+        let rect = resize_selection_rect(
+            rect,
+            ResizeHandle::SouthEast,
+            (90, 80),
+            (lw as u32, lh as u32),
+        );
+        let snapshot = OutputSnapshot {
+            logical: LogicalOutput {
+                name: "eDP-1".to_string(),
+                x: 0,
+                y: 0,
+                width: lw as u32,
+                height: lh as u32,
+            },
+            image: image::RgbaImage::new(pw as u32, ph as u32),
+        };
+        crate::selected_area_image(
+            &[snapshot],
+            &AreaSelection {
+                rect,
+                surface_size: (lw as u32, lh as u32),
+                output_name: Some("eDP-1".to_string()),
+            },
+        )
+        .unwrap();
+        drop(guard);
+
+        let json = std::fs::read_to_string(&report).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        for name in [
+            "load_from_path",
+            "load_optional_theme",
+            "load_font",
+            "font_from_path",
+            "fc_match_family",
+            "bundled_font",
+            "toolbar_layout",
+            "render_toolbar",
+            "render_button",
+            "draw_text",
+            "rasterize_icon",
+            "blit_argb",
+            "draw_selection",
+            "draw_window_highlight",
+            "move_selection_rect",
+            "resize_selection_rect",
+            "selected_area_image",
+        ] {
+            assert!(json.contains(name), "{name} missing from report:\n{json}");
+        }
     }
 }

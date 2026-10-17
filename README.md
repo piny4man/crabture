@@ -214,6 +214,10 @@ The same resolved font is used for toolbar measurement, drawing, and pointer hit
 - Appearance is loaded from a separate TOML file so saving capture preferences cannot clobber theme settings.
 - Markup and screen recording are intentionally future work. They should extend the session command/capture-result model rather than being coupled to the current still-image overlay paths.
 
+## Profiling
+
+Opt-in `hotpath` / `hotpath-alloc` cargo features report per-function timing and allocations, and `CRABTURE_PERF=1` prints open and input-to-present latencies. See [docs/hotpath-profiling.md](docs/hotpath-profiling.md) and the measured [findings](docs/hotpath-findings.md).
+
 ## License
 
 GPL-3.0 — see [LICENSE](LICENSE) for details.

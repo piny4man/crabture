@@ -17,6 +17,7 @@ use xcap::{Monitor, Window};
 
 mod appearance;
 mod overlay;
+mod perf;
 mod render;
 mod session;
 
@@ -70,6 +71,11 @@ struct Cli {
     /// Internal: daemon mode for clipboard persistence (do not use directly)
     #[arg(long = "__clipboard-daemon", hide = true)]
     clipboard_daemon: Option<PathBuf>,
+
+    /// Profiling: open the graphical UI, exit once it is on screen, and
+    /// capture nothing. See docs/hotpath-profiling.md.
+    #[arg(long, hide = true)]
+    measure: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,6 +85,7 @@ enum CliIntent {
     LegacyMenu,
     DirectCapture,
     GraphicalDefault,
+    Measure,
 }
 
 #[derive(Clone, Debug)]
@@ -149,6 +156,7 @@ impl ClipboardDaemonCommand {
 }
 
 fn main() -> Result<()> {
+    perf::mark_start();
     let cli = Cli::parse();
     let intent = cli_intent(&cli);
 
@@ -211,12 +219,20 @@ fn main() -> Result<()> {
     };
 
     match intent {
-        CliIntent::GraphicalDefault => return run_graphical_screenshot_ui(),
+        CliIntent::GraphicalDefault => {
+            let _profile = profile_scope("crabture::hud");
+            return run_graphical_screenshot_ui(false);
+        }
+        CliIntent::Measure => {
+            let _profile = profile_scope("crabture::hud");
+            return run_graphical_screenshot_ui(true);
+        }
         CliIntent::LegacyMenu => return run_interactive(&shot_dir, &cli.format),
         CliIntent::Internal | CliIntent::ListMonitors | CliIntent::DirectCapture => {}
     }
 
     if cli.select {
+        let _profile = profile_scope("crabture::select");
         let img = select_area()?;
         return save_screenshot(&img, how, &shot_dir, &cli.format);
     }
@@ -236,12 +252,32 @@ fn main() -> Result<()> {
         return save_screenshot(&img, how, &shot_dir, &cli.format);
     }
 
-    run_graphical_screenshot_ui()
+    let _profile = profile_scope("crabture::hud");
+    run_graphical_screenshot_ui(false)
+}
+
+// `#[hotpath::main]` would install this per annotated function; the overlay
+// paths have their own profiling scopes, so it is declared once here instead.
+#[cfg(feature = "hotpath-alloc")]
+#[global_allocator]
+static ALLOCATOR: hotpath::CountingAllocator = hotpath::CountingAllocator::new();
+
+/// Start a hotpath profiling scope: the report is written when the returned
+/// guard drops.  Only the overlay paths open one, so the clipboard daemon and
+/// `--list-monitors` never print a report.  A no-op without the `hotpath`
+/// feature.
+fn profile_scope(caller: &'static str) -> hotpath::HotpathGuard {
+    hotpath::HotpathGuardBuilder::new(caller)
+        .percentiles(&[50.0, 95.0, 99.0])
+        .build()
 }
 
 fn cli_intent(cli: &Cli) -> CliIntent {
     if cli.clipboard_daemon.is_some() {
         return CliIntent::Internal;
+    }
+    if cli.measure {
+        return CliIntent::Measure;
     }
     if cli.list_monitors {
         return CliIntent::ListMonitors;
@@ -255,7 +291,10 @@ fn cli_intent(cli: &Cli) -> CliIntent {
     CliIntent::GraphicalDefault
 }
 
-fn run_graphical_screenshot_ui() -> Result<()> {
+/// Run the graphical screenshot UI.  With `measure` (the hidden `--measure`
+/// flag) the full open path runs, then the HUD cancels itself once it is on
+/// screen, so nothing is captured, saved, or copied.
+fn run_graphical_screenshot_ui(measure: bool) -> Result<()> {
     let preferences = load_graphical_preferences().unwrap_or_default();
     let appearance = load_runtime_appearance();
     let mut session = CaptureSession::with_preferences(preferences);
@@ -271,8 +310,9 @@ fn run_graphical_screenshot_ui() -> Result<()> {
     // window mode.  Best-effort: an empty list just means no highlight.
     let window_rects = enumerate_window_rects();
 
-    let command = overlay::run_screenshot_hud(session.preferences(), window_rects, appearance)
-        .context("graphical UI failed")?;
+    let command =
+        overlay::run_screenshot_hud(session.preferences(), window_rects, appearance, measure)
+            .context("graphical UI failed")?;
 
     match session.handle(command) {
         SessionOutcome::Continue => Ok(()),
@@ -329,6 +369,7 @@ fn graphical_save_dir(location: SaveLocationChoice) -> PathBuf {
     }
 }
 
+#[hotpath::measure]
 fn load_runtime_appearance() -> appearance::Appearance {
     let loaded = appearance::load_from_default_path();
     for warning in loaded.warnings {
@@ -345,6 +386,7 @@ fn preferences_path() -> PathBuf {
         .join("preferences")
 }
 
+#[hotpath::measure]
 fn load_graphical_preferences() -> Option<GraphicalPreferences> {
     parse_graphical_preferences(&fs::read_to_string(preferences_path()).ok()?)
 }
@@ -490,6 +532,7 @@ fn run_interactive(shot_dir: &Path, format: &str) -> Result<()> {
 
 /// Capture the primary screen at full physical resolution using wlroots
 /// screencopy (via libwayshot-xcap).  Falls back to xcap if unavailable.
+#[hotpath::measure]
 fn capture_fullscreen() -> Result<image::RgbaImage> {
     // Try wlroots screencopy first — returns full physical resolution.
     if let Ok(conn) = libwayshot_xcap::WayshotConnection::new() {
@@ -509,6 +552,7 @@ fn capture_fullscreen() -> Result<image::RgbaImage> {
 /// Capture every monitor individually, returning a snapshot per output tagged
 /// with its logical region.  Each screenshot is at the monitor's native
 /// physical resolution.
+#[hotpath::measure]
 fn capture_all_outputs() -> Result<Vec<OutputSnapshot>> {
     // Try wlroots screencopy first — accurate physical resolution per output.
     if let Ok(conn) = libwayshot_xcap::WayshotConnection::new() {
@@ -587,6 +631,7 @@ fn select_area() -> Result<image::RgbaImage> {
     }
 }
 
+#[hotpath::measure]
 fn selected_area_image(
     snapshots: &[OutputSnapshot],
     selection: &AreaSelection,
@@ -619,6 +664,7 @@ fn selected_area_image(
     Ok(image::imageops::crop_imm(screenshot, crop.x, crop.y, crop.w, crop.h).to_image())
 }
 
+#[hotpath::measure]
 fn selected_full_screen_image<'a>(
     snapshots: &'a [OutputSnapshot],
     selection: &FullScreenSelection,
@@ -636,6 +682,7 @@ fn selected_full_screen_image<'a>(
     Ok(&snapshots[0].image)
 }
 
+#[hotpath::measure]
 fn selected_window_image(
     snapshots: &[OutputSnapshot],
     selection: &WindowSelection,
@@ -1050,6 +1097,7 @@ fn selected_window_candidate<'a>(
 /// focus history, else `xcap` window order) so the overlay highlight matches
 /// what will actually be captured.  Returns an empty list when window
 /// enumeration is unavailable, so the highlight simply degrades to nothing.
+#[hotpath::measure]
 fn enumerate_window_rects() -> Vec<(i32, i32, u32, u32)> {
     if let Some(rects) = hyprland_window_rects() {
         return rects;
@@ -1486,6 +1534,19 @@ mod tests {
         let cli = Cli::try_parse_from(["crabture"]).expect("valid cli");
 
         assert_eq!(cli_intent(&cli), CliIntent::GraphicalDefault);
+    }
+
+    #[test]
+    fn measure_opens_the_graphical_ui_without_advertising_itself() {
+        let cli = Cli::try_parse_from(["crabture", "--measure"]).expect("valid cli");
+        assert_eq!(cli_intent(&cli), CliIntent::Measure);
+
+        // A benchmark run never captures, even when combined with capture flags.
+        let cli = Cli::try_parse_from(["crabture", "--measure", "--instant"]).expect("valid cli");
+        assert_eq!(cli_intent(&cli), CliIntent::Measure);
+
+        let help = Cli::command().render_long_help().to_string();
+        assert!(!help.contains("--measure"));
     }
 
     #[test]

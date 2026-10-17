@@ -144,6 +144,7 @@ fn action_width(font: &FontVec, label: &str, hint: &str) -> f32 {
 }
 
 /// Build the toolbar layout in logical surface coordinates.
+#[hotpath::measure]
 pub fn toolbar_layout(
     surface_w: usize,
     surface_h: usize,
@@ -397,6 +398,7 @@ fn blend_px(data: &mut [u8], idx: usize, r: u8, g: u8, b: u8, a: u8) {
 }
 
 /// Draw `text` with its left edge at `x` and baseline at `baseline`.
+#[hotpath::measure]
 fn draw_text(
     pm: &mut Pixmap,
     font: &FontVec,
@@ -451,6 +453,7 @@ fn icon_bytes(icon: Icon) -> &'static [u8] {
 }
 
 /// Rasterise a mode icon to a square pixmap of `px` physical pixels.
+#[hotpath::measure]
 fn rasterize_icon(icon: Icon, px: u32, rgb: (u8, u8, u8)) -> Option<Pixmap> {
     if px == 0 {
         return None;
@@ -470,6 +473,7 @@ fn rasterize_icon(icon: Icon, px: u32, rgb: (u8, u8, u8)) -> Option<Pixmap> {
 /// Returns the pixmap plus the physical `(offset_x, offset_y)` at which it
 /// should be blitted onto the overlay canvas, or `None` if the layout is empty
 /// or allocation fails.
+#[hotpath::measure]
 pub fn render_toolbar(
     layout: &[ToolButton],
     prefs: GraphicalPreferences,
@@ -571,6 +575,7 @@ pub fn render_toolbar(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[hotpath::measure]
 fn render_button(
     pm: &mut Pixmap,
     button: &ToolButton,
@@ -740,6 +745,7 @@ fn render_button(
 
 /// Source-over composite a premultiplied-RGBA pixmap onto a premultiplied
 /// ARGB8888-LE (BGRA byte order) canvas stored as packed `u32`s.
+#[hotpath::measure]
 pub fn blit_argb(dst: &mut [u32], dst_w: usize, dst_h: usize, src: &Pixmap, ox: i32, oy: i32) {
     let sw = src.width() as i32;
     let sh = src.height() as i32;

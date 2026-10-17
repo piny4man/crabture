@@ -195,11 +195,13 @@ pub fn appearance_path() -> PathBuf {
         .join("appearance.toml")
 }
 
+#[hotpath::measure]
 pub fn load_from_default_path() -> LoadedAppearance {
     let home = env::var_os("HOME").map(PathBuf::from);
     load_from_path(&appearance_path(), home.as_deref())
 }
 
+#[hotpath::measure]
 pub fn load_from_path(path: &Path, home: Option<&Path>) -> LoadedAppearance {
     match fs::read_to_string(path) {
         Ok(contents) => match resolve_from_toml(&contents, path.parent(), home) {
@@ -317,6 +319,7 @@ fn parse_family_field(value: Option<&str>) -> Result<Option<FontFamily>, Appeara
     }
 }
 
+#[hotpath::measure]
 fn load_optional_theme(
     theme_file: Option<&str>,
     config_dir: Option<&Path>,
@@ -420,6 +423,7 @@ pub fn pack_argb(a: u8, r: u8, g: u8, b: u8) -> u32 {
     ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | b as u32
 }
 
+#[hotpath::measure]
 fn bundled_font() -> UiFont {
     UiFont {
         inner: FontVec::try_from_vec(BUNDLED_FONT_BYTES.to_vec())
@@ -428,6 +432,7 @@ fn bundled_font() -> UiFont {
     }
 }
 
+#[hotpath::measure]
 fn load_font(path: Option<&Path>, family: Option<&str>) -> UiFont {
     if let Some(path) = path.filter(|p| !p.as_os_str().is_empty())
         && let Some(font) = font_from_path(path)
@@ -443,6 +448,7 @@ fn load_font(path: Option<&Path>, family: Option<&str>) -> UiFont {
     bundled_font()
 }
 
+#[hotpath::measure]
 fn font_from_path(path: &Path) -> Option<UiFont> {
     let bytes = fs::read(path).ok()?;
     let inner = FontVec::try_from_vec(bytes).ok()?;
@@ -452,6 +458,7 @@ fn font_from_path(path: &Path) -> Option<UiFont> {
     })
 }
 
+#[hotpath::measure]
 fn fc_match_family(family: &str) -> Option<PathBuf> {
     let out = Command::new("fc-match")
         .args(["-f", "%{file}", family])
