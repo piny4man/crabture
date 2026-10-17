@@ -88,7 +88,7 @@ Most users should start here:
 crabture
 ```
 
-That opens the graphical overlay. Choose `AREA`, `WINDOW`, or `FULL`, then capture the target. Use `Escape`, right-click, or `CANCEL` to leave without changing files or the clipboard.
+That opens the graphical overlay. Choose `AREA`, `WINDOW`, or `SCREEN`, then capture the target. Use `Escape`, right-click, or `CANCEL` to leave without changing files or the clipboard.
 
 ### Common Tasks
 
@@ -144,9 +144,10 @@ Direct capture commands save files by default. Add `--copy` to copy instead. If 
 
 - `AREA`: Draw a rectangle, edit it, then capture the final selection.
 - `WINDOW`: Target a window where the platform supports it. If true window capture is unavailable, use area or full-screen capture.
-- `FULL`: Capture the current display immediately.
+- `SCREEN`: Capture the current display immediately.
 - `COPY`, `SAVE`, `COPY+SAVE`: Choose whether graphical captures copy, save, or do both.
-- `SCREENSHOTS`, `CURRENT DIR`: Choose where saved graphical captures are written.
+- `SCREENSHOTS`, `THIS FOLDER`: Choose where saved graphical captures are written (`THIS FOLDER` is the directory crabture was started from).
+- `›` on the Output, Format, and Location buttons: clicking cycles to the next value.
 - `PNG`, `JPG`: Choose the saved image format.
 - `A`: Area mode. Drag to draw a selection, adjust it, then press `Enter` or click `CAPTURE`.
 - `W`: Window mode. Move over or click a window target; click captures the selected target.
@@ -170,7 +171,7 @@ Direct capture commands save files by default. Add `--copy` to copy instead. If 
 - Wayland: verify area, window, and full-screen capture on the active compositor; confirm the overlay/HUD is absent from saved and copied images.
 - X11: verify direct capture commands and graphical fallbacks; confirm unsupported window targeting errors suggest area or full-screen capture.
 - Scaling: verify area crops on 1x, integer-scaled, and fractional-scaled displays.
-- Multi-monitor: verify `FULL`/`F` captures the intended output and `--list-monitors` reports usable monitor identities.
+- Multi-monitor: verify `SCREEN`/`F` captures the intended output and `--list-monitors` reports usable monitor identities.
 - Clipboard: verify copied images remain pasteable after the main `crabture` process exits.
 
 ## Appearance

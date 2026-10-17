@@ -35,11 +35,17 @@ const CAT_PX: f32 = 12.5;
 const VAL_PX: f32 = 13.5;
 const SHORT_PX: f32 = 10.5;
 const CAT_VAL_GAP: f32 = 6.0;
-const VAL_CARET_GAP: f32 = 6.0;
-const CARET_W: f32 = 7.0;
-const CARET_H: f32 = 4.0;
+const VAL_CUE_GAP: f32 = 6.0;
+const CUE_W: f32 = 7.0;
+const CUE_ARM_W: f32 = 4.0;
+const CUE_H: f32 = 8.0;
+const CUE_STROKE: f32 = 1.6;
 const SHORT_GAP: f32 = 8.0;
 const HINT_GAP: f32 = 7.0;
+const RETURN_W: f32 = 11.0;
+const RETURN_H: f32 = 8.0;
+const RETURN_HEAD: f32 = 3.0;
+const RETURN_STROKE: f32 = 1.4;
 const BTN_RADIUS: f32 = 9.0;
 const PANEL_RADIUS: f32 = 13.0;
 
@@ -75,9 +81,19 @@ enum ToolKind {
     },
     Action {
         label: &'static str,
-        hint: &'static str,
+        hint: Hint,
         accent: bool,
     },
+}
+
+/// The key hint drawn after an action label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hint {
+    /// A key name drawn as text (e.g. `esc`).
+    Key(&'static str),
+    /// The Return key, drawn as a vector ↵: common UI fonts (including the
+    /// bundled Roboto) have no U+23CE glyph.
+    Return,
 }
 
 /// A laid-out toolbar button.  `rect` is in logical surface coordinates so the
@@ -110,7 +126,7 @@ fn output_value(output: OutputDestination) -> &'static str {
 fn location_value(location: SaveLocationChoice) -> &'static str {
     match location {
         SaveLocationChoice::Screenshots => "Screenshots",
-        SaveLocationChoice::CurrentDirectory => "Current dir",
+        SaveLocationChoice::CurrentDirectory => "This folder",
     }
 }
 
@@ -129,19 +145,22 @@ fn chip_width(font: &FontVec, category: &str, value: &str, shortcut: char) -> f3
         + text_width(font, category, CAT_PX)
         + CAT_VAL_GAP
         + text_width(font, value, VAL_PX)
-        + VAL_CARET_GAP
-        + CARET_W
+        + VAL_CUE_GAP
+        + CUE_W
         + SHORT_GAP
         + text_width(font, &shortcut.to_string(), SHORT_PX)
         + BTN_PAD_X
 }
 
-fn action_width(font: &FontVec, label: &str, hint: &str) -> f32 {
-    BTN_PAD_X
-        + text_width(font, label, LABEL_PX)
-        + HINT_GAP
-        + text_width(font, hint, SHORT_PX)
-        + BTN_PAD_X
+fn hint_width(font: &FontVec, hint: Hint) -> f32 {
+    match hint {
+        Hint::Key(key) => text_width(font, key, SHORT_PX),
+        Hint::Return => RETURN_W,
+    }
+}
+
+fn action_width(font: &FontVec, label: &str, hint: Hint) -> f32 {
+    BTN_PAD_X + text_width(font, label, LABEL_PX) + HINT_GAP + hint_width(font, hint) + BTN_PAD_X
 }
 
 /// Build the toolbar layout in logical surface coordinates.
@@ -186,11 +205,11 @@ pub fn toolbar_layout(
         {
             let k = ToolKind::Mode {
                 icon: Icon::FullScreen,
-                label: "Full",
+                label: "Screen",
                 shortcut: 'F',
                 mode: CaptureMode::FullScreen,
             };
-            let w = mode_width(font, "Full", 'F');
+            let w = mode_width(font, "Screen", 'F');
             (k, w, 0)
         },
         {
@@ -223,19 +242,19 @@ pub fn toolbar_layout(
         {
             let k = ToolKind::Action {
                 label: "Capture",
-                hint: "\u{23ce}",
+                hint: Hint::Return,
                 accent: true,
             };
-            let w = action_width(font, "Capture", "\u{23ce}");
+            let w = action_width(font, "Capture", Hint::Return);
             (k, w, 2)
         },
         {
             let k = ToolKind::Action {
                 label: "Cancel",
-                hint: "esc",
+                hint: Hint::Key("esc"),
                 accent: false,
             };
-            let w = action_width(font, "Cancel", "esc");
+            let w = action_width(font, "Cancel", Hint::Key("esc"));
             (k, w, 2)
         },
     ];
@@ -363,21 +382,50 @@ fn fill_rect(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, c: (u8, u8, u8, u8
     }
 }
 
-/// Draw a small downward caret (▾) with its top-left at `(x, y)`.
-fn fill_caret(pm: &mut Pixmap, x: f32, y: f32, c: (u8, u8, u8, u8)) {
+/// Draw the chip's "click for the next value" cue — a right chevron (›), since
+/// clicking cycles rather than opening a menu — in the `CUE_W`-wide slot
+/// starting at `x`, vertically centred on `cy` (physical pixels).
+fn draw_cycle_cue(pm: &mut Pixmap, x: f32, cy: f32, scale: f32, c: (u8, u8, u8, u8)) {
+    let left = x + (CUE_W - CUE_ARM_W) / 2.0 * scale;
+    let half_h = CUE_H / 2.0 * scale;
     let mut pb = PathBuilder::new();
-    pb.move_to(x, y);
-    pb.line_to(x + CARET_W, y);
-    pb.line_to(x + CARET_W / 2.0, y + CARET_H);
-    pb.close();
+    pb.move_to(left, cy - half_h);
+    pb.line_to(left + CUE_ARM_W * scale, cy);
+    pb.line_to(left, cy + half_h);
     if let Some(path) = pb.finish() {
-        pm.fill_path(
-            &path,
-            &solid_paint(c),
-            FillRule::Winding,
-            Transform::identity(),
-            None,
-        );
+        let stroke = tiny_skia::Stroke {
+            width: CUE_STROKE * scale,
+            line_cap: tiny_skia::LineCap::Round,
+            line_join: tiny_skia::LineJoin::Round,
+            ..Default::default()
+        };
+        pm.stroke_path(&path, &solid_paint(c), &stroke, Transform::identity(), None);
+    }
+}
+
+/// Draw a Return-key arrow (↵) in the `RETURN_W`-wide slot starting at `x`,
+/// vertically centred on `cy` (physical pixels).
+fn draw_return_arrow(pm: &mut Pixmap, x: f32, cy: f32, scale: f32, c: (u8, u8, u8, u8)) {
+    let pad = RETURN_STROKE / 2.0 * scale;
+    let (left, right) = (x + pad, x + RETURN_W * scale - pad);
+    let top = cy - RETURN_H / 2.0 * scale;
+    let base = cy + RETURN_H / 2.0 * scale - RETURN_HEAD * scale;
+    let head = RETURN_HEAD * scale;
+    let mut pb = PathBuilder::new();
+    pb.move_to(right, top);
+    pb.line_to(right, base);
+    pb.line_to(left, base);
+    pb.move_to(left + head, base - head);
+    pb.line_to(left, base);
+    pb.line_to(left + head, base + head);
+    if let Some(path) = pb.finish() {
+        let stroke = tiny_skia::Stroke {
+            width: RETURN_STROKE * scale,
+            line_cap: tiny_skia::LineCap::Round,
+            line_join: tiny_skia::LineJoin::Round,
+            ..Default::default()
+        };
+        pm.stroke_path(&path, &solid_paint(c), &stroke, Transform::identity(), None);
     }
 }
 
@@ -690,10 +738,9 @@ fn render_button(
                 colors.text,
             );
             let val_w = text_width(font, value, VAL_PX) * scale;
-            let caret_x = val_x + val_w + VAL_CARET_GAP * scale;
-            let caret_y = py + ph / 2.0 - (CARET_H * scale) / 2.0 + scale;
-            fill_caret(pm, caret_x, caret_y, colors.text_muted);
-            let short_x = caret_x + CARET_W * scale + SHORT_GAP * scale;
+            let cue_x = val_x + val_w + VAL_CUE_GAP * scale;
+            draw_cycle_cue(pm, cue_x, py + ph / 2.0, scale, colors.text_muted);
+            let short_x = cue_x + CUE_W * scale + SHORT_GAP * scale;
             draw_text(
                 pm,
                 font,
@@ -731,15 +778,18 @@ fn render_button(
             } else {
                 colors.text_muted
             };
-            draw_text(
-                pm,
-                font,
-                hint_x,
-                baseline,
-                hint,
-                SHORT_PX * scale,
-                hint_color,
-            );
+            match hint {
+                Hint::Key(key) => draw_text(
+                    pm,
+                    font,
+                    hint_x,
+                    baseline,
+                    key,
+                    SHORT_PX * scale,
+                    hint_color,
+                ),
+                Hint::Return => draw_return_arrow(pm, hint_x, py + ph / 2.0, scale, hint_color),
+            }
         }
     }
 }
@@ -863,6 +913,107 @@ mod tests {
         );
         assert_eq!(layout[6].command, SessionCommand::Capture);
         assert_eq!(layout[7].command, SessionCommand::Cancel);
+    }
+
+    #[test]
+    fn mode_and_location_labels_name_what_they_capture_and_where() {
+        let layout = toolbar_layout(1920, 1080, prefs(), &appearance());
+        let labels: Vec<&str> = layout
+            .iter()
+            .filter_map(|b| match b.kind {
+                ToolKind::Mode { label, .. } => Some(label),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels, ["Area", "Window", "Screen"]);
+        assert_eq!(
+            location_value(SaveLocationChoice::CurrentDirectory),
+            "This folder"
+        );
+    }
+
+    /// Painted (alpha > 127) pixels of `pm` as `(x, y)`.
+    fn painted(pm: &Pixmap) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        for y in 0..pm.height() {
+            for x in 0..pm.width() {
+                if rgba_at(pm, x, y).3 > 127 {
+                    out.push((x, y));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn cycle_cue_is_a_right_chevron_that_scales() {
+        for scale in [1.0_f32, 2.0, 4.0] {
+            let size = (CUE_W * scale * 3.0).ceil() as u32;
+            let mut pm = Pixmap::new(size, size).unwrap();
+            let cy = size as f32 / 2.0;
+            draw_cycle_cue(&mut pm, CUE_W * scale, cy, scale, (255, 255, 255, 255));
+            let px = painted(&pm);
+            assert!(!px.is_empty(), "scale {scale}");
+            let (min_x, max_x) = (
+                px.iter().map(|p| p.0).min().unwrap(),
+                px.iter().map(|p| p.0).max().unwrap(),
+            );
+            let (min_y, max_y) = (
+                px.iter().map(|p| p.1).min().unwrap(),
+                px.iter().map(|p| p.1).max().unwrap(),
+            );
+            // Taller than wide, and sized in logical units.
+            assert!(max_y - min_y > max_x - min_x, "scale {scale}: {px:?}");
+            assert!((max_y - min_y + 1) as f32 >= 6.0 * scale, "scale {scale}");
+            // The tip (rightmost pixels) sits on the centre line...
+            let tip: Vec<u32> = px.iter().filter(|p| p.0 == max_x).map(|p| p.1).collect();
+            assert!(
+                tip.iter()
+                    .all(|&y| (y as f32 + 0.5 - cy).abs() <= 1.5 * scale)
+            );
+            // ...and the open left side has nothing on it.
+            assert!(
+                !px.iter()
+                    .any(|&(x, y)| x == min_x && (y as f32 + 0.5 - cy).abs() < scale)
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_font_has_no_return_symbol_glyph() {
+        let font = appearance();
+        assert_eq!(font.font().glyph_id('\u{23ce}').0, 0);
+        assert_ne!(font.font().glyph_id('e').0, 0);
+    }
+
+    #[test]
+    fn capture_hint_draws_a_return_arrow_with_the_bundled_font() {
+        let appearance = appearance();
+        let p = prefs();
+        let layout = toolbar_layout(1920, 1080, p, &appearance);
+        let capture = layout
+            .iter()
+            .position(|b| b.command == SessionCommand::Capture)
+            .unwrap();
+        let scale = 2.0;
+        let (pm, _, _) = render_toolbar(&layout, p, &appearance, 2, None).unwrap();
+        let first = &layout[0];
+        let (ox, oy) = (first.rect.0 - PANEL_PAD_X, first.rect.1 - PANEL_PAD_Y);
+        let (bx, by, bw, bh) = layout[capture].rect;
+        let label_end =
+            bx + BTN_PAD_X + text_width(appearance.font(), "Capture", LABEL_PX) + HINT_GAP / 2.0;
+        let x0 = ((label_end - ox) * scale) as u32;
+        let x1 = ((bx + bw - ox) * scale) as u32;
+        let (y0, y1) = (((by - oy) * scale) as u32, ((by + bh - oy) * scale) as u32);
+        // Count light hint pixels on the accent pill to the right of the label.
+        let lit = (y0..y1)
+            .flat_map(|y| (x0..x1).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let (r, g, b, _) = rgba_at(&pm, x, y);
+                r > 150 && g > 180 && b > 230
+            })
+            .count();
+        assert!(lit as f32 >= 12.0 * scale, "only {lit} hint pixels");
     }
 
     #[test]
@@ -1149,22 +1300,173 @@ family = "JetBrainsMono Nerd Font Mono"
 
         let (ix, iy) = button_fill_px(&layout, inactive, scale);
         assert_eq!(rgba_at(&pm, ix, iy), (0, 0, 0, 236));
-        assert!(!button_has_color_near(
-            &pm,
-            &layout,
-            inactive,
-            scale,
-            (0, 0, 255),
-            (0, 0, 0)
+        // No selection blue or accent green anywhere on the inactive button
+        // (its red text and grey hints are neither).
+        assert!(!button_has_dominant_channel(
+            &pm, &layout, inactive, scale, 2
         ));
-        assert!(!button_has_color_near(
-            &pm,
-            &layout,
-            inactive,
-            scale,
-            (0, 255, 0),
-            (0, 0, 0)
+        assert!(!button_has_dominant_channel(
+            &pm, &layout, inactive, scale, 1
         ));
+    }
+
+    /// Whether any pixel of button `index` is clearly tinted towards RGB
+    /// `channel` (0 = red, 1 = green, 2 = blue).
+    fn button_has_dominant_channel(
+        pm: &Pixmap,
+        layout: &[ToolButton],
+        index: usize,
+        scale: f32,
+        channel: usize,
+    ) -> bool {
+        let first = &layout[0];
+        let ox = first.rect.0 - PANEL_PAD_X;
+        let oy = first.rect.1 - PANEL_PAD_Y;
+        let (bx, by, bw, bh) = layout[index].rect;
+        let x0 = ((bx - ox) * scale).floor().max(0.0) as u32;
+        let y0 = ((by - oy) * scale).floor().max(0.0) as u32;
+        let x1 = ((bx + bw - ox) * scale).ceil().min(pm.width() as f32) as u32;
+        let y1 = ((by + bh - oy) * scale).ceil().min(pm.height() as f32) as u32;
+        (y0..y1).any(|y| {
+            (x0..x1).any(|x| {
+                let (r, g, b, _) = rgba_at(pm, x, y);
+                let c = [i32::from(r), i32::from(g), i32::from(b)];
+                (0..3).all(|o| o == channel || c[channel] > c[o] + 64)
+            })
+        })
+    }
+
+    fn sample_theme_appearance() -> Appearance {
+        let dir = std::env::temp_dir().join(format!(
+            "crabture-render-sample-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("theme.toml"),
+            r##"
+version = 1
+
+[colors]
+background = "#10253F"
+foreground = "#EAF3FF"
+accent = "#80D4FF"
+muted = "#A4B8CF"
+selection_background = "#244A70"
+selection_foreground = "#FFFFFF"
+
+[font]
+family = "Roboto"
+"##,
+        )
+        .unwrap();
+        let appearance = crate::appearance::resolve_from_toml(
+            "[appearance]\ntheme_file = \"theme.toml\"\n",
+            Some(&dir),
+            None,
+        )
+        .unwrap()
+        .appearance;
+        let _ = std::fs::remove_dir_all(dir);
+        appearance
+    }
+
+    /// Toolbar snapshots for docs/ui-readability-audit.md, written to
+    /// `$CRABTURE_SNAPSHOT_DIR` (default `target/ui-snapshots`).  Each frame is
+    /// composited over a mid-grey backdrop standing in for a dimmed desktop.
+    #[test]
+    #[ignore = "writes PNG snapshots for the UI readability audit"]
+    fn write_ui_snapshots() {
+        let out = std::env::var_os("CRABTURE_SNAPSHOT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/ui-snapshots")
+            });
+        std::fs::create_dir_all(&out).unwrap();
+        let with = |mode, output| GraphicalPreferences {
+            mode,
+            output,
+            ..prefs()
+        };
+        let states = [
+            (
+                "area",
+                with(CaptureMode::Area, OutputDestination::Clipboard),
+                None,
+            ),
+            (
+                "window",
+                with(CaptureMode::Window, OutputDestination::Clipboard),
+                None,
+            ),
+            (
+                "screen",
+                with(CaptureMode::FullScreen, OutputDestination::Clipboard),
+                None,
+            ),
+            (
+                "save",
+                with(CaptureMode::Area, OutputDestination::Save),
+                None,
+            ),
+            (
+                "copy-save",
+                with(CaptureMode::Area, OutputDestination::CopyAndSave),
+                None,
+            ),
+            (
+                "hover-window",
+                with(CaptureMode::Area, OutputDestination::Clipboard),
+                Some(1),
+            ),
+        ];
+        for (palette, appearance) in [
+            ("builtin", appearance()),
+            ("swatches", sample_theme_appearance()),
+        ] {
+            for scale in [1, 2] {
+                for (state, p, hovered) in states {
+                    let layout = toolbar_layout(1920, 1080, p, &appearance);
+                    let (bar, _, _) =
+                        render_toolbar(&layout, p, &appearance, scale, hovered).unwrap();
+                    let pad = 12 * scale as u32;
+                    let mut frame =
+                        Pixmap::new(bar.width() + 2 * pad, bar.height() + 2 * pad).unwrap();
+                    frame.fill(Color::from_rgba8(70, 70, 74, 255));
+                    frame.draw_pixmap(
+                        pad as i32,
+                        pad as i32,
+                        bar.as_ref(),
+                        &PixmapPaint::default(),
+                        Transform::identity(),
+                        None,
+                    );
+                    frame
+                        .save_png(out.join(format!("{palette}-{scale}x-{state}.png")))
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn themed_hover_wash_is_visibly_distinct_from_the_panel() {
+        let appearance = sample_theme_appearance();
+        let p = prefs();
+        let layout = toolbar_layout(1920, 1080, p, &appearance);
+        let window = 1;
+        let (plain, _, _) = render_toolbar(&layout, p, &appearance, 1, None).unwrap();
+        let (hovered, _, _) = render_toolbar(&layout, p, &appearance, 1, Some(window)).unwrap();
+        let (x, y) = button_fill_px(&layout, window, 1.0);
+        let (a, b) = (rgba_at(&plain, x, y), rgba_at(&hovered, x, y));
+        let delta = i32::from(a.0).abs_diff(i32::from(b.0))
+            + i32::from(a.1).abs_diff(i32::from(b.1))
+            + i32::from(a.2).abs_diff(i32::from(b.2));
+        assert!(delta >= 40, "hover {b:?} vs panel {a:?}");
     }
 
     #[test]
