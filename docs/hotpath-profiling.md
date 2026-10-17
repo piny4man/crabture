@@ -68,8 +68,10 @@ Present time comes from `wp_presentation` feedback (stamped when the
 clock); without that global the frame-done callback stands in. A frame the
 compositor discards for a newer commit drops its input sample, and during the
 open a fresh frame is requested so `--measure` cannot stall. The capture
-freeze is part of the open span: the HUD can only appear after
-`capture_all_outputs` returns.
+freeze is part of the open span: it runs on a background thread alongside
+the appearance and Wayland setup, and `OpenGate::wait` holds the first
+overlay commit until `capture_all_outputs` returns. That wait happens inside
+the first `OutputOverlay::draw`, so its total includes it.
 
 An input is answered only by a frame whose visible content differs from the
 last committed one, judged by a per-output frame key (surface size and scale,

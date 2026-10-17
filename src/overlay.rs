@@ -7,6 +7,7 @@
 //! Pointer click-drag selects the area; Escape or right-click cancels.
 
 use crate::appearance::{Appearance, ColorSet, FontKey};
+use crate::open::{CaptureDone, OpenGate, WindowRect};
 use crate::perf::{self, InputKind, InputProbe, OpenProbe};
 use crate::render;
 use crate::scene::{self, Crosshair, Outline, Rect, Scene, Sprite};
@@ -348,6 +349,7 @@ pub fn run_selection_overlay(appearance: Appearance) -> Result<OverlayResult> {
         overlays: Vec::new(),
         active_surface: None,
         window_rects: Vec::new(),
+        gate: OpenGate::open(Vec::new()),
         hud_active: false,
         preferences: GraphicalPreferences::default(),
         appearance,
@@ -397,7 +399,7 @@ pub fn run_selection_overlay(appearance: Appearance) -> Result<OverlayResult> {
 #[hotpath::measure]
 pub fn run_screenshot_hud(
     default_preferences: GraphicalPreferences,
-    window_rects: Vec<(i32, i32, u32, u32)>,
+    gate: OpenGate,
     appearance: Appearance,
     measure: bool,
 ) -> Result<SessionCommand> {
@@ -428,7 +430,8 @@ pub fn run_screenshot_hud(
         cursor_shape_device: None,
         overlays: Vec::new(),
         active_surface: None,
-        window_rects,
+        window_rects: Vec::new(),
+        gate,
         hud_active: true,
         preferences: default_preferences,
         appearance,
@@ -701,8 +704,11 @@ struct OverlayState {
 
     /// On-screen windows as global logical rectangles, ordered like the
     /// capture's window selection, used to highlight the hovered window in
-    /// window mode.  Empty when window enumeration was unavailable.
-    window_rects: Vec<(i32, i32, u32, u32)>,
+    /// window mode.  Empty when window enumeration was unavailable, and
+    /// until the open gate hands the background enumeration over.
+    window_rects: Vec<WindowRect>,
+    /// Holds the first buffer commit until the freeze capture has returned.
+    gate: OpenGate,
 
     hud_active: bool,
     preferences: GraphicalPreferences,
@@ -851,12 +857,22 @@ impl OverlayState {
             ov.draw(
                 qh,
                 shm,
+                &mut self.gate,
                 preferences,
                 appearance,
                 hud_active,
                 is_active,
                 perf,
             );
+        }
+        if let Some(rects) = self.gate.take_window_rects() {
+            self.window_rects = rects;
+        }
+        if self.gate.failed() {
+            // The capture failed: exit without ever showing the overlay; the
+            // caller reports the capture error.
+            self.cancelled = true;
+            self.exit = true;
         }
     }
 
@@ -1049,6 +1065,7 @@ impl OutputOverlay {
         &mut self,
         qh: &QueueHandle<OverlayState>,
         shm: &Shm,
+        gate: &mut OpenGate,
         preferences: GraphicalPreferences,
         appearance: &Appearance,
         hud_active: bool,
@@ -1123,6 +1140,12 @@ impl OutputOverlay {
         }
         frame.scene = Some(scene);
 
+        // Everything above overlapped the freeze capture; showing the frame
+        // must wait for it, or the overlay could appear in the screenshot.
+        let Some(captured) = gate.wait() else {
+            return;
+        };
+
         let surface = self.layer.wl_surface();
         surface.set_buffer_scale(scale as i32);
         // Damage only what changed since the last committed frame.  A frame
@@ -1142,7 +1165,7 @@ impl OutputOverlay {
         }
         self.committed = Some(scene);
 
-        frame.buffer.attach_to(surface).expect("buffer attach");
+        attach_after_capture(&frame.buffer, surface, captured);
 
         // Throttle redraws to the compositor's frame clock: always request a
         // callback for the next frame so motion-driven redraws (HUD hover,
@@ -1324,6 +1347,13 @@ impl OutputOverlay {
         });
         scene
     }
+}
+
+/// Attach an overlay buffer.  Requires the [`CaptureDone`] proof from the open
+/// gate, so no overlay content can be committed before the freeze capture
+/// has returned.
+fn attach_after_capture(buffer: &Buffer, surface: &wl_surface::WlSurface, _: CaptureDone) {
+    buffer.attach_to(surface).expect("buffer attach");
 }
 
 /// What one overlay frame shows, for the `CRABTURE_PERF` probe: only a frame
