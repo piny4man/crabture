@@ -56,3 +56,13 @@ ab_glyph = "0.2"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 swatches = "0.1.0"
+# Profiling instrumentation. Every macro is a no-op and none of hotpath's own
+# dependencies are compiled unless the `hotpath` feature below is enabled.
+hotpath = { version = "0.28", default-features = false }
+
+[features]
+# Opt-in profiling: `cargo build --release --features hotpath[,hotpath-alloc]`
+# writes a timing (and allocation) report when the overlay exits. See
+# docs/hotpath-profiling.md.
+hotpath = ["hotpath/hotpath", "hotpath/threads"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]

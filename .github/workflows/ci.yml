@@ -31,5 +31,11 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy (hotpath-alloc)
+        run: cargo clippy --all-targets --features hotpath-alloc -- -D warnings
+      - name: Test
+        run: cargo test
+      - name: Test (hotpath)
+        run: cargo test --features hotpath
       - name: Build
         run: cargo build --release
